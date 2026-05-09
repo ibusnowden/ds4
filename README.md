@@ -43,7 +43,7 @@ That said, a few important things about this project:
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache It is actually a first class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
-* This is **Metal-only**, may implement CUDA support in the future? Perhaps, but nothing more. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. I was not possible to fix the CPU inference to avoid crashing, since each time there is to restart the computer, which is not funny. Help us, if you have the guts.
+* Metal is the original fast path; a **CUDA backend** is now also implemented and runs the full forward pass on NVIDIA GPUs (alpha — see the Speed section). The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. I was not possible to fix the CPU inference to avoid crashing, since each time there is to restart the computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -101,37 +101,31 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 
 ## Speed
 
-These are single-run CLI numbers with the q2 GGUF, `--ctx 32768`, `--nothink`,
-greedy decoding, and `-n 256`. The short prompt is a normal small Italian story
-prompt. The long prompt is 11709 tokens and exercises chunked prefill plus
-long-context decode.
+Single-run CUDA CLI numbers with the q2 GGUF, `--ctx 32768`, `--nothink`, greedy
+decoding, and `-n 256` against a normal small Italian story prompt.
 
-| Machine | Backend | Prompt | Prefill | Generation |
-| --- | --- | ---: | ---: | ---: |
-| Mac Studio M3 Ultra, 512 GB | metal | 11709 tokens | 468.03 t/s | 27.39 t/s |
-| 1× RTX 6000 Ada, 48 GiB (alpha) | cuda | short | 1.65 t/s | 1.64 t/s |
+| GPU | VRAM | Prompt | Prefill | Generation |
+| --- | ---: | --- | ---: | ---: |
+| 1× RTX 6000 Ada (alpha) | 48 GiB | short | 1.65 t/s | 1.64 t/s |
 
-The CUDA backend is currently a correctness-first alpha: it runs the full
-DS4 forward pass on GPU through all 43 layers (verified bit-for-bit against the
-CPU reference for short greedy decodes), but throughput is capped by PCIe
-weight streaming and not yet by the GPU's compute or memory bandwidth.
+The CUDA backend is currently a correctness-first alpha: the full DS4 forward
+pass runs on GPU through all 43 layers (verified bit-for-bit against the CPU
+reference for short greedy decodes and deterministic across runs), but
+throughput is capped by PCIe weight streaming and not yet by the GPU's compute
+or memory bandwidth.
 
-### Why the RTX number is far below Mac, and how to close the gap
+### Why throughput is low on a single RTX 6000 Ada, and the path to fix it
 
 The 80.76 GiB q2 GGUF does not fit in 48 GiB of VRAM, so weights are
 **host-registered (`cuMemHostRegister`) and read over PCIe** as the kernels
-execute. Mac systems benefit from unified memory: on the M3 Ultra the entire
-model lives in the same 800 GB/s pool the GPU computes against, with zero
-transfer cost.
+execute. For an MoE token, only about 6 of 256 routed experts plus the shared
+expert are active. Per-token weight read is ~9–10 GiB. PCIe Gen4 x16 caps real
+bandwidth near 28–32 GiB/s, so the decode throughput is roughly
+`9.5 GiB / 30 GiB/s ≈ 320 ms/token ≈ 3 t/s`. The current 1.6 t/s is close to
+that ceiling once launch overhead is added, so kernel-level micro-optimization
+alone cannot beat ~3 t/s on a single 48 GiB card with this model.
 
-For an MoE token, only about 6 of 256 routed experts plus the shared expert are
-active. Per-token weight read is ~9–10 GiB. PCIe Gen4 x16 caps real bandwidth
-near 28–32 GiB/s, so the decode throughput is roughly `9.5 GiB / 30 GiB/s ≈ 320
-ms/token ≈ 3 t/s`. The current 1.6 t/s is close to that ceiling once
-launch overhead is added, so kernel-level micro-optimization alone cannot beat
-~3 t/s on a single 48 GiB card with this model.
-
-To genuinely match or exceed the Mac numbers on RTX, the throughput plan is:
+The optimization plan, ordered by impact:
 
 1. **Two RTX 6000 Adas with tensor parallelism (decisive, ~10× decode).** The
    `bigTiger` SLURM partition exposes 2× 48 GiB cards and the existing job
@@ -142,12 +136,9 @@ To genuinely match or exceed the Mac numbers on RTX, the throughput plan is:
    only a ~16 KiB residual / activations cross the PCIe peer link per layer.
 2. **Chunked prefill on the GPU (50–100× prefill).** Today CUDA prefill loops
    `cuda_graph_eval_token` over prompt tokens, so prefill ≈ decode tok/s. The
-   Metal 468 t/s number comes from layer-major chunked prefill: project Q/K/V
-   for *all* prompt tokens at one layer with one big GEMM, then prefix attention
-   over the batch, then FFN. The CPU reference (`prefill_layer_major_cpu` in
-   `ds4.c:7401`) and the Metal port (`metal_graph_prefill_chunked` in
-   `ds4.c:12795`) are the templates. With proper batched matvecs through Tensor
-   Cores this should beat the M3 Ultra prefill on a single GPU.
+   layer-major prefill in the CPU reference (`prefill_layer_major_cpu` in
+   `ds4.c:7401`) is the template: project Q/K/V for *all* prompt tokens at one
+   layer with one big GEMM, then prefix attention over the batch, then FFN.
 3. **CUDA graph capture (3–5× decode).** Decode is the same 1300+ kernel
    sequence every token. Capture once with `cuStreamBeginCapture` /
    `cuGraphInstantiate` and replay with `cuGraphLaunch`. Eliminates
@@ -165,13 +156,13 @@ To genuinely match or exceed the Mac numbers on RTX, the throughput plan is:
 6. **Activation prequant alignment with the CPU reference (parity + small
    perf).** The CPU side prequantizes activations to Q8_0/Q8_K before each
    matvec; the GPU side currently dot-products against FP32 activations
-   directly. Aligning the GPU to the CPU pipeline closes the small
-   accumulated numerical drift that makes argmax flip on long greedy decodes,
-   and lets the matvecs use Ada's int8 MMA units.
+   directly. Aligning the GPU to the CPU pipeline closes the small accumulated
+   numerical drift that makes argmax flip on long greedy decodes, and lets the
+   matvecs use Ada's int8 MMA units.
 
 Items 2–6 stack on a single GPU and would push a single RTX 6000 Ada into the
-~10–15 t/s range despite PCIe; item 1 is what unlocks throughput beyond the
-Mac numbers.
+~10–15 t/s range despite PCIe; item 1 is what unlocks higher throughput by
+moving weights into device VRAM.
 
 ## CLI
 
@@ -189,8 +180,8 @@ ds4>
 ```
 
 The interactive CLI is a real multi-turn DS4 chat. It keeps the rendered chat
-transcript and the live Metal KV checkpoint, so each turn extends the previous
-conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
+transcript and the live KV checkpoint (Metal or CUDA, whichever backend is
+selected), so each turn extends the previous conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 `/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
 and returns to `ds4>`.
 
@@ -208,14 +199,15 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The server is Metal-only. It keeps one mutable graph/KV checkpoint in memory,
-so stateless clients that resend a longer version of the same prompt can reuse
-the shared prefix instead of pre-filling from token zero.
+The server runs on Metal or CUDA depending on how the build is configured. It
+keeps one mutable graph/KV checkpoint in memory, so stateless clients that
+resend a longer version of the same prompt can reuse the shared prefix instead
+of pre-filling from token zero.
 
 Request parsing and sockets run in client threads, but inference itself is
-serialized through one Metal worker. The current server does not batch multiple
-independent requests together; concurrent requests wait their turn on the single
-live graph/session.
+serialized through one inference worker. The current server does not batch
+multiple independent requests together; concurrent requests wait their turn on
+the single live graph/session.
 
 Supported endpoints:
 
@@ -298,30 +290,21 @@ Runtime files stay in this checkout: `./gguf/` for model files, `./kv/` for
 disk KV cache, `./logs/current-ds4.env` for the active endpoint, and
 `./logs/benchmarks/` for benchmark JSON.
 
-The CUDA backend is an explicit engine target now, but the CUDA graph executor
-still has to be implemented before RTX inference is GPU-resident. CUDA sessions
-now return real logits by using the complete 43-layer CPU reference bridge for
-prefill/decode while the CUDA graph port continues. This keeps the OpenAI server
-and Pi usable on RTX allocations, but any reported tok/s from this bridge is CPU
-reference throughput, not CUDA graph throughput. CUDA session allocation, device
-tensors, copies, module loading, kernel launch wrappers, NVRTC source loading,
-device-mapped GGUF tensor-data registration, and the first device kernels
-(clear, token embedding into HC state, F16 matvec, Q8_0 matvec, HC=4
-split/weighted-sum+RMSNorm, RMSNorm, head RMSNorm, RoPE tail, one-row
-sink-aware attention, grouped Q8_0 attention output, HC=4 post, SwiGLU, routed
-IQ2_XXS gate/up, Q2_K down accumulation, hash router select/weighting, row
-softmax, and argmax) are present for the executor port.
-A CUDA session now requires `libnvrtc` so those kernels can be compiled and
-loaded without adding a build-time CUDA toolkit dependency.
+The CUDA backend now runs the full DS4 forward pass on GPU through all 43
+layers as the default `--backend cuda` path. The executor covers HC pre/post,
+the Q LoRA + KV projection + RoPE + FP8 KV round-trip pipeline, the raw SWA +
+compressor + indexer attention path, the routed IQ2_XXS / Q2_K MoE plus shared
+expert, and the output HC head + LM head. The CPU reference bridge is still
+linked and selectable with `DS4_CUDA_BRIDGE=1` for bit-exact debugging, but it
+is no longer the default. A CUDA session requires `libnvrtc` so the kernels can
+be compiled and loaded at runtime without adding a build-time CUDA toolkit
+dependency.
 
-`./start-ds4-pi.sh --cuda-smoke` submits a short Slurm job that validates the
-CUDA allocation, model mapping, driver initialization, CUDA session scratch
-allocation, GGUF tensor-data host registration, NVRTC kernel compilation,
-module load, and a trivial kernel launch. Set `DS4_CUDA_LAYER0_PROBE=1` during
-prompt sync to also probe real model-weight reads through the semantic layer-0
-attention and FFN CUDA primitives. It writes `./logs/cuda-smoke-<jobid>.log`.
-Real chat currently runs through the CPU reference bridge; CUDA graph tok/s
-remains blocked by the missing full graph executor.
+`./start-ds4-pi.sh --cuda-smoke` submits a short Slurm job that validates CUDA
+allocation, GGUF tensor-data host registration, and NVRTC kernel compilation
+for the full executor. Set `DS4_CUDA_LAYER0_PROBE=1` during prompt sync to also
+probe real model-weight reads through the semantic layer-0 attention and FFN
+CUDA primitives. The probe writes `./logs/cuda-smoke-<jobid>.log`.
 
 #### RTX benchmark log
 
@@ -608,10 +591,17 @@ the kv cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default backend is Metal:
+Metal is the original fast path on Apple Silicon:
 
 ```sh
 ./ds4 -p "Hello" --metal
+```
+
+CUDA runs the full DS4 forward pass on NVIDIA GPUs (alpha; see the Speed
+section for current numbers and the optimization roadmap):
+
+```sh
+./ds4 -p "Hello" --cuda
 ```
 
 There is also a CPU reference/debug path:
@@ -620,9 +610,10 @@ There is also a CPU reference/debug path:
 ./ds4 -p "Hello" --cpu
 ```
 
-Do not treat the CPU path as the production target. The server is Metal-only,
-and the optimized implementation lives in the Metal graph path. This may
-change in the future.
+Do not treat the CPU path as the production target. Set `DS4_CUDA_BRIDGE=1` to
+force a running CUDA build to fall back to the CPU reference for prefill and
+decode; this is useful for bit-exact parity debugging while the GPU executor is
+being tuned.
 
 ## Test Vectors
 
