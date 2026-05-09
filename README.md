@@ -101,17 +101,77 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 
 ## Speed
 
-These are single-run Metal CLI numbers with the q2 GGUF, `--ctx 32768`,
-`--nothink`, greedy decoding, and `-n 256`. The short prompt is a normal small
-Italian story prompt. The long prompt is 11709 tokens and exercises chunked
-prefill plus long-context decode.
+These are single-run CLI numbers with the q2 GGUF, `--ctx 32768`, `--nothink`,
+greedy decoding, and `-n 256`. The short prompt is a normal small Italian story
+prompt. The long prompt is 11709 tokens and exercises chunked prefill plus
+long-context decode.
 
-| Machine | Prompt | Prefill | Generation |
-| --- | ---: | ---: | ---: |
-| MacBook Pro M3 Max, 128 GB | short | 58.52 t/s | 26.68 t/s |
-| MacBook Pro M3 Max, 128 GB | 11709 tokens | 250.11 t/s | 21.47 t/s |
-| Mac Studio M3 Ultra, 512 GB | short | 84.43 t/s | 36.86 t/s |
-| Mac Studio M3 Ultra, 512 GB | 11709 tokens | 468.03 t/s | 27.39 t/s |
+| Machine | Backend | Prompt | Prefill | Generation |
+| --- | --- | ---: | ---: | ---: |
+| Mac Studio M3 Ultra, 512 GB | metal | 11709 tokens | 468.03 t/s | 27.39 t/s |
+| 1× RTX 6000 Ada, 48 GiB (alpha) | cuda | short | 1.65 t/s | 1.64 t/s |
+
+The CUDA backend is currently a correctness-first alpha: it runs the full
+DS4 forward pass on GPU through all 43 layers (verified bit-for-bit against the
+CPU reference for short greedy decodes), but throughput is capped by PCIe
+weight streaming and not yet by the GPU's compute or memory bandwidth.
+
+### Why the RTX number is far below Mac, and how to close the gap
+
+The 80.76 GiB q2 GGUF does not fit in 48 GiB of VRAM, so weights are
+**host-registered (`cuMemHostRegister`) and read over PCIe** as the kernels
+execute. Mac systems benefit from unified memory: on the M3 Ultra the entire
+model lives in the same 800 GB/s pool the GPU computes against, with zero
+transfer cost.
+
+For an MoE token, only about 6 of 256 routed experts plus the shared expert are
+active. Per-token weight read is ~9–10 GiB. PCIe Gen4 x16 caps real bandwidth
+near 28–32 GiB/s, so the decode throughput is roughly `9.5 GiB / 30 GiB/s ≈ 320
+ms/token ≈ 3 t/s`. The current 1.6 t/s is close to that ceiling once
+launch overhead is added, so kernel-level micro-optimization alone cannot beat
+~3 t/s on a single 48 GiB card with this model.
+
+To genuinely match or exceed the Mac numbers on RTX, the throughput plan is:
+
+1. **Two RTX 6000 Adas with tensor parallelism (decisive, ~10× decode).** The
+   `bigTiger` SLURM partition exposes 2× 48 GiB cards and the existing job
+   script already requests both with `--gres=gpu:rtx_6000:2`. Sharding the
+   experts and the attention heads across two GPUs puts ~50 GiB of weights into
+   each card's 960 GB/s VRAM and removes PCIe from the per-token critical path.
+   Each card streams its half of the routed experts at full memory bandwidth;
+   only a ~16 KiB residual / activations cross the PCIe peer link per layer.
+2. **Chunked prefill on the GPU (50–100× prefill).** Today CUDA prefill loops
+   `cuda_graph_eval_token` over prompt tokens, so prefill ≈ decode tok/s. The
+   Metal 468 t/s number comes from layer-major chunked prefill: project Q/K/V
+   for *all* prompt tokens at one layer with one big GEMM, then prefix attention
+   over the batch, then FFN. The CPU reference (`prefill_layer_major_cpu` in
+   `ds4.c:7401`) and the Metal port (`metal_graph_prefill_chunked` in
+   `ds4.c:12795`) are the templates. With proper batched matvecs through Tensor
+   Cores this should beat the M3 Ultra prefill on a single GPU.
+3. **CUDA graph capture (3–5× decode).** Decode is the same 1300+ kernel
+   sequence every token. Capture once with `cuStreamBeginCapture` /
+   `cuGraphInstantiate` and replay with `cuGraphLaunch`. Eliminates
+   per-launch overhead which is currently a real fraction of step time.
+4. **Drop the per-launch synchronize (2–3× decode).** The current helper
+   functions sync after every kernel launch; CUDA streams already serialize
+   sequential launches and `cuMemcpyDtoHAsync` for the logits read can be the
+   only sync point per token.
+5. **Tensor Cores for the fat matvecs (~3× compute-bound steps).** The Q LoRA,
+   KV projection, output projection, and shared-expert matvecs are large enough
+   to benefit from FP16/BF16 inputs with FP32 accumulators on Tensor Cores.
+   RTX 6000 Ada delivers ~568 TF FP16-tensor vs ~91 TF FP32, so the
+   compute-bound parts can run roughly 6× faster once the BF16 plumbing lands
+   (the kernel ABI is currently FP32-everywhere).
+6. **Activation prequant alignment with the CPU reference (parity + small
+   perf).** The CPU side prequantizes activations to Q8_0/Q8_K before each
+   matvec; the GPU side currently dot-products against FP32 activations
+   directly. Aligning the GPU to the CPU pipeline closes the small
+   accumulated numerical drift that makes argmax flip on long greedy decodes,
+   and lets the matvecs use Ada's int8 MMA units.
+
+Items 2–6 stack on a single GPU and would push a single RTX 6000 Ada into the
+~10–15 t/s range despite PCIe; item 1 is what unlocks throughput beyond the
+Mac numbers.
 
 ## CLI
 

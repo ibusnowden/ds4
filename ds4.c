@@ -13514,6 +13514,26 @@ struct ds4_engine {
 };
 
 #ifndef DS4_NO_CUDA
+/* Per-layer GPU KV cache for the full executor.  raw_kv exists for every
+ * layer; the compressed and indexer caches/state are only allocated for
+ * layers whose compress_ratio is nonzero or 4 respectively.  Counters live
+ * on the host and are passed as launch args. */
+typedef struct {
+    ds4_cuda_tensor *raw_kv;          /* raw_cap * DS4_N_HEAD_DIM f32 */
+    ds4_cuda_tensor *attn_comp_kv;    /* comp_cap * DS4_N_HEAD_DIM f32 */
+    ds4_cuda_tensor *index_comp_kv;   /* comp_cap * DS4_N_INDEXER_HEAD_DIM f32 */
+    ds4_cuda_tensor *attn_state_kv;   /* state rows * (coff*DS4_N_HEAD_DIM) f32 */
+    ds4_cuda_tensor *attn_state_score;
+    ds4_cuda_tensor *index_state_kv;
+    ds4_cuda_tensor *index_state_score;
+    uint32_t comp_cap;       /* per-layer cap = ctx_size / ratio + 2 */
+    uint32_t state_rows;     /* ratio for ratio<4, 2*ratio for ratio==4 */
+    uint32_t coff;           /* ratio==4 ? 2 : 1 */
+    uint32_t n_raw;
+    uint32_t n_comp;
+    uint32_t n_index_comp;
+} ds4_cuda_layer_cache;
+
 typedef struct {
     uint32_t ctx_size;
     uint32_t prefill_cap;
@@ -13575,11 +13595,134 @@ typedef struct {
     ds4_cuda_kernel *rope_tail_f32;
     ds4_cuda_kernel *softmax_f32;
     ds4_cuda_kernel *argmax_f32;
+    /* Kernels added for the full executor (see ds4_cuda_kernels.c). They are
+     * NVRTC-compiled and loaded by cuda_graph_load_executor; the host-side
+     * orchestration that actually calls them is still in progress. */
+    ds4_cuda_kernel *kv_fp8_round_trip_f32;
+    ds4_cuda_kernel *router_topk_select_f32;
+    ds4_cuda_kernel *attention_mixed_f32;
+    ds4_cuda_kernel *compressor_pool_norm_f32;
+    ds4_cuda_kernel *compressor_proj_state_f32;
+    ds4_cuda_kernel *indexer_scores_f32;
+    ds4_cuda_kernel *indexer_topk_mask_f32;
+    ds4_cuda_kernel *output_hc_weighted_sum_f32;
+    ds4_cuda_kernel *output_hc_weights_f32;
+    ds4_cuda_kernel *head_rms_norm_weight_f32;
+    ds4_cuda_kernel *copy_f32;
+    ds4_cuda_kernel *indexer_weight_scale_f32;
+    ds4_cuda_kernel *router_probs_f32;
+    /* Per-layer GPU KV cache for the full executor; allocated by cuda_graph_alloc. */
+    ds4_cuda_layer_cache layer_cache[DS4_N_LAYER];
+    /* Activation tensors for the full forward pass. */
+    ds4_cuda_tensor *eval_attn_norm;
+    ds4_cuda_tensor *eval_qr;
+    ds4_cuda_tensor *eval_qr_norm;
+    ds4_cuda_tensor *eval_q;
+    ds4_cuda_tensor *eval_kv_raw;
+    ds4_cuda_tensor *eval_kv;
+    ds4_cuda_tensor *eval_heads;
+    ds4_cuda_tensor *eval_attn_low;
+    ds4_cuda_tensor *eval_attn_out;
+    ds4_cuda_tensor *eval_after_attn_hc;
+    ds4_cuda_tensor *eval_attn_cur;
+    ds4_cuda_tensor *eval_hc_mix;
+    ds4_cuda_tensor *eval_hc_split;
+    ds4_cuda_tensor *eval_flat_hc;
+    ds4_cuda_tensor *eval_ffn_cur;
+    ds4_cuda_tensor *eval_ffn_norm;
+    ds4_cuda_tensor *eval_ffn_hc_mix;
+    ds4_cuda_tensor *eval_ffn_hc_split;
+    ds4_cuda_tensor *eval_shared_gate;
+    ds4_cuda_tensor *eval_shared_up;
+    ds4_cuda_tensor *eval_shared_mid;
+    ds4_cuda_tensor *eval_shared_out;
+    ds4_cuda_tensor *eval_routed_mid;
+    ds4_cuda_tensor *eval_routed_out;
+    ds4_cuda_tensor *eval_ffn_out;
+    ds4_cuda_tensor *eval_router_logits;
+    ds4_cuda_tensor *eval_router_probs;
+    ds4_cuda_tensor *eval_router_selected;
+    ds4_cuda_tensor *eval_router_weights;
+    ds4_cuda_tensor *eval_comp;            /* DS4_N_HEAD_DIM */
+    ds4_cuda_tensor *eval_index_comp;      /* DS4_N_INDEXER_HEAD_DIM */
+    ds4_cuda_tensor *eval_index_q;         /* DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM */
+    ds4_cuda_tensor *eval_index_weights;   /* DS4_N_INDEXER_HEAD */
+    ds4_cuda_tensor *eval_index_scores;    /* comp_cap (max) */
+    ds4_cuda_tensor *eval_index_allowed;   /* comp_cap (max) u32 */
+    ds4_cuda_tensor *eval_output_pre;      /* DS4_N_HC */
+    ds4_cuda_tensor *eval_output_weights;  /* DS4_N_HC */
+    ds4_cuda_tensor *eval_output_embd;     /* DS4_N_EMBD */
+    ds4_cuda_tensor *eval_output_norm;     /* DS4_N_EMBD */
+    bool full_executor_ready;
     bool executor_ready;
 } ds4_cuda_graph;
 
 static void cuda_graph_free(ds4_cuda_graph *g) {
     if (!g) return;
+    /* Free per-layer caches first. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_cuda_layer_cache *lc = &g->layer_cache[il];
+        ds4_cuda_tensor_free(lc->index_state_score);
+        ds4_cuda_tensor_free(lc->index_state_kv);
+        ds4_cuda_tensor_free(lc->attn_state_score);
+        ds4_cuda_tensor_free(lc->attn_state_kv);
+        ds4_cuda_tensor_free(lc->index_comp_kv);
+        ds4_cuda_tensor_free(lc->attn_comp_kv);
+        ds4_cuda_tensor_free(lc->raw_kv);
+    }
+    /* Free per-token activation tensors. */
+    ds4_cuda_tensor_free(g->eval_output_norm);
+    ds4_cuda_tensor_free(g->eval_output_embd);
+    ds4_cuda_tensor_free(g->eval_output_weights);
+    ds4_cuda_tensor_free(g->eval_output_pre);
+    ds4_cuda_tensor_free(g->eval_index_allowed);
+    ds4_cuda_tensor_free(g->eval_index_scores);
+    ds4_cuda_tensor_free(g->eval_index_weights);
+    ds4_cuda_tensor_free(g->eval_index_q);
+    ds4_cuda_tensor_free(g->eval_index_comp);
+    ds4_cuda_tensor_free(g->eval_comp);
+    ds4_cuda_tensor_free(g->eval_router_weights);
+    ds4_cuda_tensor_free(g->eval_router_selected);
+    ds4_cuda_tensor_free(g->eval_router_probs);
+    ds4_cuda_tensor_free(g->eval_router_logits);
+    ds4_cuda_tensor_free(g->eval_ffn_out);
+    ds4_cuda_tensor_free(g->eval_routed_out);
+    ds4_cuda_tensor_free(g->eval_routed_mid);
+    ds4_cuda_tensor_free(g->eval_shared_out);
+    ds4_cuda_tensor_free(g->eval_shared_mid);
+    ds4_cuda_tensor_free(g->eval_shared_up);
+    ds4_cuda_tensor_free(g->eval_shared_gate);
+    ds4_cuda_tensor_free(g->eval_ffn_hc_split);
+    ds4_cuda_tensor_free(g->eval_ffn_hc_mix);
+    ds4_cuda_tensor_free(g->eval_ffn_norm);
+    ds4_cuda_tensor_free(g->eval_ffn_cur);
+    ds4_cuda_tensor_free(g->eval_flat_hc);
+    ds4_cuda_tensor_free(g->eval_hc_split);
+    ds4_cuda_tensor_free(g->eval_hc_mix);
+    ds4_cuda_tensor_free(g->eval_attn_cur);
+    ds4_cuda_tensor_free(g->eval_after_attn_hc);
+    ds4_cuda_tensor_free(g->eval_attn_out);
+    ds4_cuda_tensor_free(g->eval_attn_low);
+    ds4_cuda_tensor_free(g->eval_heads);
+    ds4_cuda_tensor_free(g->eval_kv);
+    ds4_cuda_tensor_free(g->eval_kv_raw);
+    ds4_cuda_tensor_free(g->eval_q);
+    ds4_cuda_tensor_free(g->eval_qr_norm);
+    ds4_cuda_tensor_free(g->eval_qr);
+    ds4_cuda_tensor_free(g->eval_attn_norm);
+    ds4_cuda_kernel_free(g->router_probs_f32);
+    ds4_cuda_kernel_free(g->indexer_weight_scale_f32);
+    ds4_cuda_kernel_free(g->copy_f32);
+    ds4_cuda_kernel_free(g->head_rms_norm_weight_f32);
+    ds4_cuda_kernel_free(g->output_hc_weights_f32);
+    ds4_cuda_kernel_free(g->output_hc_weighted_sum_f32);
+    ds4_cuda_kernel_free(g->indexer_topk_mask_f32);
+    ds4_cuda_kernel_free(g->indexer_scores_f32);
+    ds4_cuda_kernel_free(g->compressor_proj_state_f32);
+    ds4_cuda_kernel_free(g->compressor_pool_norm_f32);
+    ds4_cuda_kernel_free(g->attention_mixed_f32);
+    ds4_cuda_kernel_free(g->router_topk_select_f32);
+    ds4_cuda_kernel_free(g->kv_fp8_round_trip_f32);
     ds4_cuda_kernel_free(g->argmax_f32);
     ds4_cuda_kernel_free(g->softmax_f32);
     ds4_cuda_kernel_free(g->rope_tail_f32);
@@ -13680,7 +13823,20 @@ static bool cuda_graph_load_executor(ds4_cuda_graph *g, char *err, size_t errlen
         !ds4_cuda_module_get_kernel(&g->head_rms_norm_f32, g->module, "ds4_head_rms_norm_f32", err, errlen) ||
         !ds4_cuda_module_get_kernel(&g->rope_tail_f32, g->module, "ds4_rope_tail_f32", err, errlen) ||
         !ds4_cuda_module_get_kernel(&g->softmax_f32, g->module, "ds4_softmax_f32", err, errlen) ||
-        !ds4_cuda_module_get_kernel(&g->argmax_f32, g->module, "ds4_argmax_f32", err, errlen))
+        !ds4_cuda_module_get_kernel(&g->argmax_f32, g->module, "ds4_argmax_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->kv_fp8_round_trip_f32, g->module, "ds4_kv_fp8_round_trip_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->router_topk_select_f32, g->module, "ds4_router_topk_select_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->attention_mixed_f32, g->module, "ds4_attention_mixed_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->compressor_pool_norm_f32, g->module, "ds4_compressor_pool_norm_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->compressor_proj_state_f32, g->module, "ds4_compressor_proj_state_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->indexer_scores_f32, g->module, "ds4_indexer_scores_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->indexer_topk_mask_f32, g->module, "ds4_indexer_topk_mask_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->output_hc_weighted_sum_f32, g->module, "ds4_output_hc_weighted_sum_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->output_hc_weights_f32, g->module, "ds4_output_hc_weights_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->head_rms_norm_weight_f32, g->module, "ds4_head_rms_norm_weight_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->copy_f32, g->module, "ds4_copy_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->indexer_weight_scale_f32, g->module, "ds4_indexer_weight_scale_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->router_probs_f32, g->module, "ds4_router_probs_f32", err, errlen))
     {
         return false;
     }
@@ -14337,6 +14493,854 @@ static bool cuda_graph_probe_layer0_q_path(ds4_cuda_graph *g,
     return true;
 }
 
+/* =========================================================================
+ * Full CUDA executor: helper launchers and per-token forward pass.
+ * =========================================================================
+ *
+ * These mirror the CPU reference in ds4.c around layer_forward_raw_swa_one
+ * and forward_token_raw_swa_cpu_decode_scratch.  They use the kernels added
+ * in ds4_cuda_kernels.c plus the existing kernels.  All FP32; matches the
+ * existing kernel ABI.
+ *
+ * Wiring point: ds4_session_eval_internal calls cuda_graph_eval_token. The
+ * CPU bridge stays available behind DS4_CUDA_BRIDGE for fallback debugging.
+ */
+
+#define DS4_CUDA_LAUNCH(kernel, gx, gy, gz, bx, by, bz, shm, args)                       \
+    do {                                                                                  \
+        if (ds4_cuda_launch_kernel((kernel), (gx), (gy), (gz), (bx), (by), (bz), (shm),  \
+                                   (args), err, errlen) == 0) return false;              \
+    } while (0)
+
+#define DS4_CUDA_SYNC()                                                                   \
+    do { if (ds4_cuda_synchronize(err, errlen) == 0) return false; } while (0)
+
+static bool cuda_eval_launch_kv_fp8(ds4_cuda_graph *g, ds4_cuda_tensor *kv,
+                                    uint32_t head_dim, uint32_t n_rot,
+                                    char *err, size_t errlen) {
+    uint64_t kv_ptr = ds4_cuda_tensor_device_ptr(kv);
+    uint32_t n_nope = head_dim - n_rot;
+    uint32_t groups = (n_nope + 63u) / 64u;
+    void *args[] = { &kv_ptr, &head_dim, &n_rot };
+    DS4_CUDA_LAUNCH(g->kv_fp8_round_trip_f32, groups, 1, 1, 64, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_head_rms(ds4_cuda_graph *g, ds4_cuda_tensor *x,
+                                      uint32_t n_head, uint32_t head_dim,
+                                      char *err, size_t errlen) {
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    float eps = DS4_RMS_EPS;
+    void *args[] = { &x_ptr, &n_head, &head_dim, &eps };
+    DS4_CUDA_LAUNCH(g->head_rms_norm_f32, n_head, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_rms_general(ds4_cuda_graph *g,
+                                         ds4_cuda_tensor *dst,
+                                         ds4_cuda_tensor *src,
+                                         uint64_t weight_ptr,
+                                         uint32_t n,
+                                         bool use_weight,
+                                         char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t src_ptr = ds4_cuda_tensor_device_ptr(src);
+    uint32_t src_stride = n;
+    uint32_t dst_stride = n;
+    float eps = DS4_RMS_EPS;
+    int use = use_weight ? 1 : 0;
+    void *args[] = { &dst_ptr, &src_ptr, &weight_ptr, &n, &src_stride, &dst_stride, &eps, &use };
+    DS4_CUDA_LAUNCH(g->rms_norm_f32, 1, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_matvec_f16(ds4_cuda_graph *g, ds4_cuda_tensor *dst,
+                                        uint64_t w_ptr, ds4_cuda_tensor *x,
+                                        uint32_t in_dim, uint32_t out_dim,
+                                        char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    void *args[] = { &dst_ptr, &w_ptr, &x_ptr, &in_dim, &out_dim };
+    DS4_CUDA_LAUNCH(g->matvec_f16_f32, out_dim, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_matvec_q8_0(ds4_cuda_graph *g, ds4_cuda_tensor *dst,
+                                         uint64_t w_ptr, ds4_cuda_tensor *x,
+                                         uint32_t in_dim, uint32_t out_dim,
+                                         char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    void *args[] = { &dst_ptr, &w_ptr, &x_ptr, &in_dim, &out_dim };
+    DS4_CUDA_LAUNCH(g->matvec_q8_0_f32, out_dim, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_matvec_q8_0_grouped(ds4_cuda_graph *g, ds4_cuda_tensor *dst,
+                                                 uint64_t w_ptr, ds4_cuda_tensor *x,
+                                                 uint32_t group_dim, uint32_t rank,
+                                                 uint32_t n_groups,
+                                                 char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    void *args[] = { &dst_ptr, &w_ptr, &x_ptr, &group_dim, &rank, &n_groups };
+    DS4_CUDA_LAUNCH(g->matvec_q8_0_grouped_f32, rank * n_groups, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_rope(ds4_cuda_graph *g, ds4_cuda_tensor *x,
+                                  uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
+                                  uint32_t pos, uint32_t il, bool inverse,
+                                  char *err, size_t errlen) {
+    return cuda_graph_launch_rope(g, x, n_head, head_dim, n_rot, pos, il, inverse, err, errlen);
+}
+
+static bool cuda_eval_launch_swiglu(ds4_cuda_graph *g, ds4_cuda_tensor *dst,
+                                    ds4_cuda_tensor *gate, ds4_cuda_tensor *up,
+                                    uint32_t n, float clamp,
+                                    char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t gate_ptr = ds4_cuda_tensor_device_ptr(gate);
+    uint64_t up_ptr = ds4_cuda_tensor_device_ptr(up);
+    float scale = 1.0f;
+    void *args[] = { &dst_ptr, &gate_ptr, &up_ptr, &n, &clamp, &scale };
+    const uint32_t block = 256;
+    const uint32_t grid = (n + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->swiglu_f32, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_add(ds4_cuda_graph *g, ds4_cuda_tensor *dst,
+                                 ds4_cuda_tensor *a, ds4_cuda_tensor *b, uint32_t n,
+                                 char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t a_ptr = ds4_cuda_tensor_device_ptr(a);
+    uint64_t b_ptr = ds4_cuda_tensor_device_ptr(b);
+    void *args[] = { &dst_ptr, &a_ptr, &b_ptr, &n };
+    const uint32_t block = 256;
+    const uint32_t grid = (n + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->add_f32, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_attention_mixed(ds4_cuda_graph *g,
+                                             ds4_cuda_tensor *out_heads,
+                                             ds4_cuda_tensor *q,
+                                             ds4_cuda_tensor *raw_kv, uint32_t n_raw,
+                                             ds4_cuda_tensor *comp_kv, uint32_t n_comp,
+                                             ds4_cuda_tensor *allowed_or_null,
+                                             uint64_t sinks_ptr, uint32_t head_dim,
+                                             char *err, size_t errlen) {
+    uint64_t out_ptr = ds4_cuda_tensor_device_ptr(out_heads);
+    uint64_t q_ptr = ds4_cuda_tensor_device_ptr(q);
+    uint64_t raw_ptr = ds4_cuda_tensor_device_ptr(raw_kv);
+    uint64_t comp_ptr = comp_kv ? ds4_cuda_tensor_device_ptr(comp_kv) : 0;
+    uint64_t allowed_ptr = allowed_or_null ? ds4_cuda_tensor_device_ptr(allowed_or_null) : 0;
+    float kq_scale = 1.0f / sqrtf((float)head_dim);
+    void *args[] = {
+        &out_ptr, &q_ptr, &raw_ptr, &n_raw, &comp_ptr, &n_comp,
+        &allowed_ptr, &sinks_ptr, &head_dim, &kq_scale,
+    };
+    uint32_t shared_bytes = (n_raw + n_comp) * (uint32_t)sizeof(float);
+    DS4_CUDA_LAUNCH(g->attention_mixed_f32, DS4_N_HEAD, 1, 1, 256, 1, 1, shared_bytes, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_compressor_proj_state(ds4_cuda_graph *g,
+                                                   ds4_cuda_tensor *state_kv,
+                                                   ds4_cuda_tensor *state_score,
+                                                   uint64_t wkv_ptr, uint64_t wgate_ptr,
+                                                   uint64_t ape_ptr,
+                                                   ds4_cuda_tensor *x,
+                                                   uint32_t row, uint32_t width,
+                                                   uint32_t in_dim, uint32_t pos_mod,
+                                                   uint32_t ape_height,
+                                                   char *err, size_t errlen) {
+    uint64_t state_kv_ptr = ds4_cuda_tensor_device_ptr(state_kv);
+    uint64_t state_score_ptr = ds4_cuda_tensor_device_ptr(state_score);
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    void *args[] = {
+        &state_kv_ptr, &state_score_ptr, &wkv_ptr, &wgate_ptr, &ape_ptr, &x_ptr,
+        &row, &width, &in_dim, &pos_mod, &ape_height,
+    };
+    DS4_CUDA_LAUNCH(g->compressor_proj_state_f32, width, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_compressor_pool(ds4_cuda_graph *g,
+                                             ds4_cuda_tensor *out,
+                                             ds4_cuda_tensor *state_kv,
+                                             ds4_cuda_tensor *state_score,
+                                             uint32_t head_dim, uint32_t compress_ratio,
+                                             char *err, size_t errlen) {
+    uint64_t out_ptr = ds4_cuda_tensor_device_ptr(out);
+    uint64_t kv_ptr = ds4_cuda_tensor_device_ptr(state_kv);
+    uint64_t score_ptr = ds4_cuda_tensor_device_ptr(state_score);
+    uint64_t norm_dummy = 0;
+    float eps = DS4_RMS_EPS;
+    void *args[] = { &out_ptr, &kv_ptr, &score_ptr, &norm_dummy, &head_dim, &compress_ratio, &eps };
+    const uint32_t block = 256;
+    const uint32_t grid = (head_dim + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->compressor_pool_norm_f32, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_indexer_scores(ds4_cuda_graph *g,
+                                            ds4_cuda_tensor *scores,
+                                            ds4_cuda_tensor *q,
+                                            ds4_cuda_tensor *index_comp,
+                                            ds4_cuda_tensor *weights,
+                                            uint32_t n_comp, uint32_t n_head, uint32_t head_dim,
+                                            char *err, size_t errlen) {
+    uint64_t s_ptr = ds4_cuda_tensor_device_ptr(scores);
+    uint64_t q_ptr = ds4_cuda_tensor_device_ptr(q);
+    uint64_t k_ptr = ds4_cuda_tensor_device_ptr(index_comp);
+    uint64_t w_ptr = ds4_cuda_tensor_device_ptr(weights);
+    void *args[] = { &s_ptr, &q_ptr, &k_ptr, &w_ptr, &n_comp, &n_head, &head_dim };
+    DS4_CUDA_LAUNCH(g->indexer_scores_f32, n_comp, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_indexer_topk(ds4_cuda_graph *g,
+                                          ds4_cuda_tensor *allowed,
+                                          ds4_cuda_tensor *scores,
+                                          uint32_t n_comp, uint32_t top_k,
+                                          char *err, size_t errlen) {
+    uint64_t a_ptr = ds4_cuda_tensor_device_ptr(allowed);
+    uint64_t s_ptr = ds4_cuda_tensor_device_ptr(scores);
+    void *args[] = { &a_ptr, &s_ptr, &n_comp, &top_k };
+    DS4_CUDA_LAUNCH(g->indexer_topk_mask_f32, 1, 1, 1, 1, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_router_probs(ds4_cuda_graph *g,
+                                          ds4_cuda_tensor *probs,
+                                          ds4_cuda_tensor *logits,
+                                          uint32_t n_expert,
+                                          char *err, size_t errlen) {
+    uint64_t p_ptr = ds4_cuda_tensor_device_ptr(probs);
+    uint64_t l_ptr = ds4_cuda_tensor_device_ptr(logits);
+    void *args[] = { &p_ptr, &l_ptr, &n_expert };
+    const uint32_t block = 256;
+    const uint32_t grid = (n_expert + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->router_probs_f32, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_router_topk(ds4_cuda_graph *g,
+                                         ds4_cuda_tensor *selected,
+                                         ds4_cuda_tensor *weights,
+                                         ds4_cuda_tensor *probs,
+                                         uint64_t bias_ptr,
+                                         uint32_t n_expert, uint32_t n_used,
+                                         char *err, size_t errlen) {
+    uint64_t s_ptr = ds4_cuda_tensor_device_ptr(selected);
+    uint64_t w_ptr = ds4_cuda_tensor_device_ptr(weights);
+    uint64_t p_ptr = ds4_cuda_tensor_device_ptr(probs);
+    int has_bias = bias_ptr != 0 ? 1 : 0;
+    float weight_scale = DS4_EXPERT_WEIGHT_SCALE;
+    void *args[] = {
+        &s_ptr, &w_ptr, &p_ptr, &bias_ptr,
+        &n_expert, &n_used, &has_bias, &weight_scale,
+    };
+    DS4_CUDA_LAUNCH(g->router_topk_select_f32, 1, 1, 1, 1, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_indexer_weight_scale(ds4_cuda_graph *g,
+                                                  ds4_cuda_tensor *weights,
+                                                  uint32_t n_head, float scale,
+                                                  char *err, size_t errlen) {
+    uint64_t w_ptr = ds4_cuda_tensor_device_ptr(weights);
+    void *args[] = { &w_ptr, &n_head, &scale };
+    const uint32_t block = 64;
+    const uint32_t grid = (n_head + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->indexer_weight_scale_f32, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_output_hc_weights(ds4_cuda_graph *g,
+                                               ds4_cuda_tensor *weights,
+                                               ds4_cuda_tensor *pre,
+                                               uint64_t scale_ptr, uint64_t base_ptr,
+                                               uint32_t n_hc, float eps,
+                                               char *err, size_t errlen) {
+    uint64_t w_ptr = ds4_cuda_tensor_device_ptr(weights);
+    uint64_t p_ptr = ds4_cuda_tensor_device_ptr(pre);
+    void *args[] = { &w_ptr, &p_ptr, &scale_ptr, &base_ptr, &n_hc, &eps };
+    DS4_CUDA_LAUNCH(g->output_hc_weights_f32, 1, 1, 1, 1, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_output_hc_weighted_sum(ds4_cuda_graph *g,
+                                                    ds4_cuda_tensor *out,
+                                                    ds4_cuda_tensor *inp_hc,
+                                                    ds4_cuda_tensor *weights,
+                                                    uint32_t n_embd, uint32_t n_hc,
+                                                    char *err, size_t errlen) {
+    uint64_t out_ptr = ds4_cuda_tensor_device_ptr(out);
+    uint64_t in_ptr = ds4_cuda_tensor_device_ptr(inp_hc);
+    uint64_t w_ptr = ds4_cuda_tensor_device_ptr(weights);
+    void *args[] = { &out_ptr, &in_ptr, &w_ptr, &n_embd, &n_hc };
+    const uint32_t block = 256;
+    const uint32_t grid = (n_embd + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->output_hc_weighted_sum_f32, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+/* ----- Per-layer weight pointer cache for the eval orchestrator ----- */
+
+typedef struct {
+    uint64_t hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm;
+    uint64_t attn_q_a, attn_q_a_norm, attn_q_b;
+    uint64_t attn_kv, attn_kv_a_norm, attn_sinks;
+    uint64_t attn_output_a, attn_output_b;
+    uint64_t attn_compressor_kv, attn_compressor_gate, attn_compressor_ape, attn_compressor_norm;
+    uint64_t indexer_attn_q_b, indexer_proj;
+    uint64_t indexer_compressor_kv, indexer_compressor_gate, indexer_compressor_ape, indexer_compressor_norm;
+    uint64_t hc_ffn_fn, hc_ffn_scale, hc_ffn_base, ffn_norm;
+    uint64_t ffn_gate_inp, ffn_exp_probs_b, ffn_gate_tid2eid;
+    uint64_t ffn_gate_exps, ffn_up_exps, ffn_down_exps;
+    uint64_t ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp;
+    uint64_t gate_expert_bytes, gate_row_bytes;
+    uint64_t up_expert_bytes, up_row_bytes;
+    uint64_t down_expert_bytes, down_row_bytes;
+    bool has_hash_router;
+    bool has_exp_probs_b;
+    uint32_t ratio;
+    uint32_t comp_ape_height;
+    uint32_t comp_width;
+    uint32_t index_comp_ape_height;
+    uint32_t index_comp_width;
+} cuda_layer_ptrs;
+
+static bool cuda_layer_collect_ptrs(ds4_cuda_graph *g, const ds4_model *model,
+                                    const ds4_layer_weights *layer, uint32_t il,
+                                    cuda_layer_ptrs *out, char *err, size_t errlen) {
+    memset(out, 0, sizeof(*out));
+    out->ratio = ds4_layer_compress_ratio(il);
+    if (!cuda_graph_tensor_device_ptr(g, model, layer->hc_attn_fn, &out->hc_attn_fn, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->hc_attn_scale, &out->hc_attn_scale, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->hc_attn_base, &out->hc_attn_base, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->attn_norm, &out->attn_norm, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->attn_q_a, &out->attn_q_a, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->attn_q_a_norm, &out->attn_q_a_norm, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->attn_q_b, &out->attn_q_b, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->attn_kv, &out->attn_kv, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->attn_kv_a_norm, &out->attn_kv_a_norm, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->attn_sinks, &out->attn_sinks, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->attn_output_a, &out->attn_output_a, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->attn_output_b, &out->attn_output_b, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->hc_ffn_fn, &out->hc_ffn_fn, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->hc_ffn_scale, &out->hc_ffn_scale, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->hc_ffn_base, &out->hc_ffn_base, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->ffn_norm, &out->ffn_norm, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->ffn_gate_inp, &out->ffn_gate_inp, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->ffn_gate_exps, &out->ffn_gate_exps, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->ffn_up_exps, &out->ffn_up_exps, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->ffn_down_exps, &out->ffn_down_exps, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->ffn_gate_shexp, &out->ffn_gate_shexp, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->ffn_up_shexp, &out->ffn_up_shexp, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, layer->ffn_down_shexp, &out->ffn_down_shexp, err, errlen))
+    {
+        return false;
+    }
+    if (out->ratio != 0) {
+        if (!cuda_graph_tensor_device_ptr(g, model, layer->attn_compressor_kv, &out->attn_compressor_kv, err, errlen) ||
+            !cuda_graph_tensor_device_ptr(g, model, layer->attn_compressor_gate, &out->attn_compressor_gate, err, errlen) ||
+            !cuda_graph_tensor_device_ptr(g, model, layer->attn_compressor_ape, &out->attn_compressor_ape, err, errlen) ||
+            !cuda_graph_tensor_device_ptr(g, model, layer->attn_compressor_norm, &out->attn_compressor_norm, err, errlen))
+        {
+            return false;
+        }
+        out->comp_ape_height = layer->attn_compressor_ape->dim[1];
+        out->comp_width = layer->attn_compressor_ape->dim[0];
+    }
+    if (out->ratio == 4u) {
+        if (!cuda_graph_tensor_device_ptr(g, model, layer->indexer_attn_q_b, &out->indexer_attn_q_b, err, errlen) ||
+            !cuda_graph_tensor_device_ptr(g, model, layer->indexer_proj, &out->indexer_proj, err, errlen) ||
+            !cuda_graph_tensor_device_ptr(g, model, layer->indexer_compressor_kv, &out->indexer_compressor_kv, err, errlen) ||
+            !cuda_graph_tensor_device_ptr(g, model, layer->indexer_compressor_gate, &out->indexer_compressor_gate, err, errlen) ||
+            !cuda_graph_tensor_device_ptr(g, model, layer->indexer_compressor_ape, &out->indexer_compressor_ape, err, errlen) ||
+            !cuda_graph_tensor_device_ptr(g, model, layer->indexer_compressor_norm, &out->indexer_compressor_norm, err, errlen))
+        {
+            return false;
+        }
+        out->index_comp_ape_height = layer->indexer_compressor_ape->dim[1];
+        out->index_comp_width = layer->indexer_compressor_ape->dim[0];
+    }
+    out->has_hash_router = layer->ffn_gate_tid2eid != NULL;
+    if (out->has_hash_router) {
+        if (!cuda_graph_tensor_device_ptr(g, model, layer->ffn_gate_tid2eid, &out->ffn_gate_tid2eid, err, errlen)) return false;
+    }
+    out->has_exp_probs_b = layer->ffn_exp_probs_b != NULL;
+    if (out->has_exp_probs_b) {
+        if (!cuda_graph_tensor_device_ptr(g, model, layer->ffn_exp_probs_b, &out->ffn_exp_probs_b, err, errlen)) return false;
+    }
+    out->gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    out->up_row_bytes = routed_expert_row_bytes(layer->ffn_up_exps);
+    out->down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    out->gate_expert_bytes = layer->ffn_gate_exps->dim[1] * out->gate_row_bytes;
+    out->up_expert_bytes = layer->ffn_up_exps->dim[1] * out->up_row_bytes;
+    out->down_expert_bytes = layer->ffn_down_exps->dim[1] * out->down_row_bytes;
+    return true;
+}
+
+/* Copy g->eval_kv into the next slot of layer raw_kv cache, with SWA shift if at cap. */
+static bool cuda_eval_push_raw_kv(ds4_cuda_graph *g, uint32_t il, char *err, size_t errlen) {
+    ds4_cuda_layer_cache *lc = &g->layer_cache[il];
+    const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    if (lc->n_raw < g->raw_cap) {
+        if (!ds4_cuda_tensor_copy(lc->raw_kv, (uint64_t)lc->n_raw * row_bytes,
+                                  g->eval_kv, 0, row_bytes)) {
+            snprintf(err, errlen, "CUDA raw KV cache push failed (layer %u)", il);
+            return false;
+        }
+        lc->n_raw++;
+    } else {
+        /* SWA shift: drop row 0, slide [1..cap-1] into [0..cap-2], place new row at end. */
+        if (!ds4_cuda_tensor_copy(lc->raw_kv, 0, lc->raw_kv, row_bytes,
+                                  (uint64_t)(g->raw_cap - 1) * row_bytes)) {
+            snprintf(err, errlen, "CUDA raw KV cache shift failed (layer %u)", il);
+            return false;
+        }
+        if (!ds4_cuda_tensor_copy(lc->raw_kv, (uint64_t)(g->raw_cap - 1) * row_bytes,
+                                  g->eval_kv, 0, row_bytes)) {
+            snprintf(err, errlen, "CUDA raw KV cache final write failed (layer %u)", il);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool cuda_eval_push_comp_kv(ds4_cuda_graph *g, uint32_t il, char *err, size_t errlen) {
+    ds4_cuda_layer_cache *lc = &g->layer_cache[il];
+    const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    if (lc->n_comp >= lc->comp_cap) {
+        snprintf(err, errlen, "CUDA compressed cache full at layer %u", il);
+        return false;
+    }
+    if (!ds4_cuda_tensor_copy(lc->attn_comp_kv, (uint64_t)lc->n_comp * row_bytes,
+                              g->eval_comp, 0, row_bytes)) {
+        snprintf(err, errlen, "CUDA comp KV push failed (layer %u)", il);
+        return false;
+    }
+    lc->n_comp++;
+    return true;
+}
+
+static bool cuda_eval_push_index_comp_kv(ds4_cuda_graph *g, uint32_t il, char *err, size_t errlen) {
+    ds4_cuda_layer_cache *lc = &g->layer_cache[il];
+    const uint64_t row_bytes = (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    if (lc->n_index_comp >= lc->comp_cap) {
+        snprintf(err, errlen, "CUDA indexer cache full at layer %u", il);
+        return false;
+    }
+    if (!ds4_cuda_tensor_copy(lc->index_comp_kv, (uint64_t)lc->n_index_comp * row_bytes,
+                              g->eval_index_comp, 0, row_bytes)) {
+        snprintf(err, errlen, "CUDA indexer comp push failed (layer %u)", il);
+        return false;
+    }
+    lc->n_index_comp++;
+    return true;
+}
+
+/* For ratio==4, after a compressor emit the state buffer rotates so older rows
+ * occupy [0..ratio) and the freshly-written rows shift into [ratio..2*ratio).
+ * Mirrors the post-emit memcpy block in compressor_decode_one_decode_scratch. */
+static bool cuda_eval_compressor_state_shift(ds4_cuda_graph *g,
+                                             ds4_cuda_tensor *state_kv,
+                                             ds4_cuda_tensor *state_score,
+                                             uint32_t state_rows, uint32_t width,
+                                             char *err, size_t errlen) {
+    (void)g;
+    /* The CPU code first copies rows[0..ratio) := rows[ratio..2*ratio), then
+     * rows[ratio..2*ratio) := rows[0..ratio). Net effect: both halves end up
+     * holding the freshly-written half (the older rows are discarded). */
+    if (state_rows < 2u) return true; /* No-op for ratio<4. */
+    uint32_t half = state_rows / 2u;
+    uint64_t row_bytes = (uint64_t)width * sizeof(float);
+    uint64_t half_bytes = (uint64_t)half * row_bytes;
+    if (!ds4_cuda_tensor_copy(state_kv, 0, state_kv, half_bytes, half_bytes) ||
+        !ds4_cuda_tensor_copy(state_score, 0, state_score, half_bytes, half_bytes) ||
+        !ds4_cuda_tensor_copy(state_kv, half_bytes, state_kv, 0, half_bytes) ||
+        !ds4_cuda_tensor_copy(state_score, half_bytes, state_score, 0, half_bytes))
+    {
+        snprintf(err, errlen, "CUDA compressor state shift failed");
+        return false;
+    }
+    return true;
+}
+
+/* The big one: full per-token forward pass. cur_hc/next_hc are swapped between
+ * layers (the caller provides the initial cur_hc, ie the embedded token). */
+static bool cuda_graph_eval_token(ds4_cuda_graph *g,
+                                  const ds4_model *model,
+                                  const ds4_weights *weights,
+                                  int token, uint32_t pos,
+                                  char *err, size_t errlen) {
+    if (!g || !g->executor_ready || !model || !weights) {
+        snprintf(err, errlen, "CUDA graph eval is not ready");
+        return false;
+    }
+
+    /* 1. Embed the token into cur_hc (writes 4 HC copies of the embedding). */
+    if (!cuda_graph_embed_token(g, model, weights, token, err, errlen)) return false;
+
+    const uint32_t hc_dim = (uint32_t)((uint64_t)DS4_N_HC * DS4_N_EMBD);
+    const uint32_t hc_mix = 2u * DS4_N_HC + DS4_N_HC * DS4_N_HC;
+    const uint32_t q_dim = (uint32_t)((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM);
+    const uint32_t out_low_dim = DS4_N_OUT_GROUP * DS4_N_LORA_O;
+
+    ds4_cuda_tensor *cur_hc = g->cur_hc;
+    ds4_cuda_tensor *next_hc = g->next_hc;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        cuda_layer_ptrs L;
+        if (!cuda_layer_collect_ptrs(g, model, &weights->layer[il], il, &L, err, errlen)) return false;
+        ds4_cuda_layer_cache *lc = &g->layer_cache[il];
+
+        /* --- Attention sublayer --- */
+        /* HC pre + attn norm: rms-no-weight on flat HC -> matvec_f16 to mix -> hc4_split_norm. */
+        if (!cuda_eval_launch_rms_general(g, g->eval_flat_hc, cur_hc, 0, hc_dim, false, err, errlen)) return false;
+        if (!cuda_eval_launch_matvec_f16(g, g->eval_hc_mix, L.hc_attn_fn, g->eval_flat_hc, hc_dim, hc_mix, err, errlen)) return false;
+        {
+            uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(g->eval_attn_cur);
+            uint64_t norm_dst_ptr = ds4_cuda_tensor_device_ptr(g->eval_attn_norm);
+            uint64_t split_ptr = ds4_cuda_tensor_device_ptr(g->eval_hc_split);
+            uint64_t mix_ptr = ds4_cuda_tensor_device_ptr(g->eval_hc_mix);
+            uint64_t x_ptr = ds4_cuda_tensor_device_ptr(cur_hc);
+            uint32_t n_embd_v = DS4_N_EMBD;
+            uint32_t sinkhorn_iters = DS4_N_HC_SINKHORN_ITER;
+            float eps = DS4_HC_EPS;
+            float norm_eps = DS4_RMS_EPS;
+            void *args[] = {
+                &dst_ptr, &norm_dst_ptr, &split_ptr, &mix_ptr,
+                &L.hc_attn_scale, &L.hc_attn_base, &x_ptr, &L.attn_norm,
+                &n_embd_v, &sinkhorn_iters, &eps, &norm_eps,
+            };
+            DS4_CUDA_LAUNCH(g->hc4_split_weighted_sum_norm_f32, 1, 1, 1, 256, 1, 1, 0, args);
+            DS4_CUDA_SYNC();
+        }
+
+        /* Q LoRA: q_a then q_a_norm (per-1024 rms-with-weight) then q_b then per-head rms-no-weight. */
+        if (!cuda_eval_launch_matvec_q8_0(g, g->eval_qr, L.attn_q_a, g->eval_attn_norm,
+                                          DS4_N_EMBD, DS4_N_LORA_Q, err, errlen)) return false;
+        if (!cuda_eval_launch_rms_general(g, g->eval_qr_norm, g->eval_qr, L.attn_q_a_norm,
+                                          DS4_N_LORA_Q, true, err, errlen)) return false;
+        if (!cuda_eval_launch_matvec_q8_0(g, g->eval_q, L.attn_q_b, g->eval_qr_norm,
+                                          DS4_N_LORA_Q, q_dim, err, errlen)) return false;
+        if (!cuda_eval_launch_head_rms(g, g->eval_q, DS4_N_HEAD, DS4_N_HEAD_DIM, err, errlen)) return false;
+
+        /* KV proj: matvec_q8_0 then rms-with-weight (kv_a_norm) into eval_kv. */
+        if (!cuda_eval_launch_matvec_q8_0(g, g->eval_kv_raw, L.attn_kv, g->eval_attn_norm,
+                                          DS4_N_EMBD, DS4_N_HEAD_DIM, err, errlen)) return false;
+        if (!cuda_eval_launch_rms_general(g, g->eval_kv, g->eval_kv_raw, L.attn_kv_a_norm,
+                                          DS4_N_HEAD_DIM, true, err, errlen)) return false;
+
+        /* RoPE on Q and KV. */
+        if (!cuda_eval_launch_rope(g, g->eval_q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false, err, errlen)) return false;
+        if (!cuda_eval_launch_rope(g, g->eval_kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false, err, errlen)) return false;
+
+        /* FP8 round-trip on KV's non-rotated half. */
+        if (!cuda_eval_launch_kv_fp8(g, g->eval_kv, DS4_N_HEAD_DIM, DS4_N_ROT, err, errlen)) return false;
+
+        /* Push KV into raw cache. */
+        if (!cuda_eval_push_raw_kv(g, il, err, errlen)) return false;
+
+        /* --- Compressor and indexer (only ratio != 0) --- */
+        if (L.ratio != 0) {
+            const uint32_t pos_mod = pos % L.ratio;
+            const uint32_t row = (L.ratio == 4u) ? L.ratio + pos_mod : pos_mod;
+            const bool should_compress = ((pos + 1u) % L.ratio) == 0;
+
+            if (!cuda_eval_launch_compressor_proj_state(g,
+                    lc->attn_state_kv, lc->attn_state_score,
+                    L.attn_compressor_kv, L.attn_compressor_gate, L.attn_compressor_ape,
+                    g->eval_attn_norm, row, L.comp_width, DS4_N_EMBD, pos_mod, L.comp_ape_height,
+                    err, errlen))
+                return false;
+
+            if (should_compress) {
+                /* Pool -> RMS-with-weight -> RoPE -> FP8 round-trip -> push into attn_comp_kv -> state shift. */
+                if (!cuda_eval_launch_compressor_pool(g, g->eval_comp,
+                        lc->attn_state_kv, lc->attn_state_score,
+                        DS4_N_HEAD_DIM, L.ratio, err, errlen)) return false;
+                if (!cuda_eval_launch_rms_general(g, g->eval_comp, g->eval_comp,
+                        L.attn_compressor_norm, DS4_N_HEAD_DIM, true, err, errlen)) return false;
+                const uint32_t comp_pos = pos + 1u - L.ratio;
+                if (!cuda_eval_launch_rope(g, g->eval_comp, 1u, DS4_N_HEAD_DIM, DS4_N_ROT, comp_pos, il, false, err, errlen)) return false;
+                if (!cuda_eval_launch_kv_fp8(g, g->eval_comp, DS4_N_HEAD_DIM, DS4_N_ROT, err, errlen)) return false;
+                if (!cuda_eval_push_comp_kv(g, il, err, errlen)) return false;
+                if (L.ratio == 4u) {
+                    if (!cuda_eval_compressor_state_shift(g, lc->attn_state_kv, lc->attn_state_score,
+                                                          lc->state_rows, L.comp_width, err, errlen))
+                        return false;
+                }
+            }
+
+            if (L.ratio == 4u) {
+                /* Indexer compressor: separate state buffers, 128-dim head, no FP8 round-trip on emit. */
+                if (!cuda_eval_launch_compressor_proj_state(g,
+                        lc->index_state_kv, lc->index_state_score,
+                        L.indexer_compressor_kv, L.indexer_compressor_gate, L.indexer_compressor_ape,
+                        g->eval_attn_norm, row, L.index_comp_width, DS4_N_EMBD, pos_mod, L.index_comp_ape_height,
+                        err, errlen))
+                    return false;
+                if (should_compress) {
+                    if (!cuda_eval_launch_compressor_pool(g, g->eval_index_comp,
+                            lc->index_state_kv, lc->index_state_score,
+                            DS4_N_INDEXER_HEAD_DIM, L.ratio, err, errlen)) return false;
+                    if (!cuda_eval_launch_rms_general(g, g->eval_index_comp, g->eval_index_comp,
+                            L.indexer_compressor_norm, DS4_N_INDEXER_HEAD_DIM, true, err, errlen)) return false;
+                    const uint32_t comp_pos = pos + 1u - L.ratio;
+                    if (!cuda_eval_launch_rope(g, g->eval_index_comp, 1u, DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
+                                               comp_pos, il, false, err, errlen)) return false;
+                    /* Note: indexer KV does NOT receive FP8 round-trip (head_dim != DS4_N_HEAD_DIM). */
+                    if (!cuda_eval_push_index_comp_kv(g, il, err, errlen)) return false;
+                    if (!cuda_eval_compressor_state_shift(g, lc->index_state_kv, lc->index_state_score,
+                                                          lc->state_rows, L.index_comp_width, err, errlen))
+                        return false;
+                }
+            }
+        }
+
+        /* --- Indexer mask (ratio == 4 only) --- */
+        ds4_cuda_tensor *allowed_tensor = NULL;
+        if (L.ratio == 4u && lc->n_index_comp > 0) {
+            const uint32_t n_idx_q_dim = DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+            if (!cuda_eval_launch_matvec_f16(g, g->eval_index_q, L.indexer_attn_q_b, g->eval_qr_norm,
+                                             DS4_N_LORA_Q, n_idx_q_dim, err, errlen)) return false;
+            if (!cuda_eval_launch_rope(g, g->eval_index_q, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
+                                       DS4_N_ROT, pos, il, false, err, errlen)) return false;
+            if (!cuda_eval_launch_matvec_f16(g, g->eval_index_weights, L.indexer_proj, g->eval_attn_cur,
+                                             DS4_N_EMBD, DS4_N_INDEXER_HEAD, err, errlen)) return false;
+            float scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
+            if (!cuda_eval_launch_indexer_weight_scale(g, g->eval_index_weights, DS4_N_INDEXER_HEAD,
+                                                      scale, err, errlen)) return false;
+            if (!cuda_eval_launch_indexer_scores(g, g->eval_index_scores, g->eval_index_q,
+                                                 lc->index_comp_kv, g->eval_index_weights,
+                                                 lc->n_index_comp, DS4_N_INDEXER_HEAD,
+                                                 DS4_N_INDEXER_HEAD_DIM, err, errlen)) return false;
+            uint32_t top_k = DS4_N_INDEXER_TOP_K < lc->n_index_comp ? DS4_N_INDEXER_TOP_K : lc->n_index_comp;
+            if (!cuda_eval_launch_indexer_topk(g, g->eval_index_allowed, g->eval_index_scores,
+                                               lc->n_index_comp, top_k, err, errlen)) return false;
+            allowed_tensor = g->eval_index_allowed;
+        }
+
+        /* --- Mixed attention (or raw-only) --- */
+        if (!cuda_eval_launch_attention_mixed(g, g->eval_heads, g->eval_q,
+                                              lc->raw_kv, lc->n_raw,
+                                              lc->attn_comp_kv, lc->n_comp,
+                                              allowed_tensor,
+                                              L.attn_sinks, DS4_N_HEAD_DIM, err, errlen)) return false;
+
+        /* Inverse RoPE on heads. */
+        if (!cuda_eval_launch_rope(g, g->eval_heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true, err, errlen)) return false;
+
+        /* Grouped output projection: matvec_q8_0_grouped (low) then matvec_q8_0 (out). */
+        if (!cuda_eval_launch_matvec_q8_0_grouped(g, g->eval_attn_low, L.attn_output_a, g->eval_heads,
+                                                  DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP),
+                                                  DS4_N_LORA_O, DS4_N_OUT_GROUP, err, errlen)) return false;
+        if (!cuda_eval_launch_matvec_q8_0(g, g->eval_attn_out, L.attn_output_b, g->eval_attn_low,
+                                          out_low_dim, DS4_N_EMBD, err, errlen)) return false;
+
+        /* HC post: attn_out + residual (cur_hc) -> after_attn_hc. */
+        {
+            uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(g->eval_after_attn_hc);
+            uint64_t block_ptr = ds4_cuda_tensor_device_ptr(g->eval_attn_out);
+            uint64_t residual_ptr = ds4_cuda_tensor_device_ptr(cur_hc);
+            uint64_t split_ptr = ds4_cuda_tensor_device_ptr(g->eval_hc_split);
+            uint32_t n_embd_v = DS4_N_EMBD;
+            void *args[] = { &dst_ptr, &block_ptr, &residual_ptr, &split_ptr, &n_embd_v };
+            const uint32_t block = 256;
+            const uint32_t grid = (n_embd_v + block - 1u) / block;
+            DS4_CUDA_LAUNCH(g->hc4_post_f32, grid, 1, 1, block, 1, 1, 0, args);
+            DS4_CUDA_SYNC();
+        }
+
+        /* --- FFN sublayer --- */
+        /* HC pre + ffn norm into (eval_ffn_cur, eval_ffn_norm). */
+        if (!cuda_eval_launch_rms_general(g, g->eval_flat_hc, g->eval_after_attn_hc, 0, hc_dim, false, err, errlen)) return false;
+        if (!cuda_eval_launch_matvec_f16(g, g->eval_ffn_hc_mix, L.hc_ffn_fn, g->eval_flat_hc, hc_dim, hc_mix, err, errlen)) return false;
+        {
+            uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(g->eval_ffn_cur);
+            uint64_t norm_dst_ptr = ds4_cuda_tensor_device_ptr(g->eval_ffn_norm);
+            uint64_t split_ptr = ds4_cuda_tensor_device_ptr(g->eval_ffn_hc_split);
+            uint64_t mix_ptr = ds4_cuda_tensor_device_ptr(g->eval_ffn_hc_mix);
+            uint64_t x_ptr = ds4_cuda_tensor_device_ptr(g->eval_after_attn_hc);
+            uint32_t n_embd_v = DS4_N_EMBD;
+            uint32_t sinkhorn_iters = DS4_N_HC_SINKHORN_ITER;
+            float eps = DS4_HC_EPS;
+            float norm_eps = DS4_RMS_EPS;
+            void *args[] = {
+                &dst_ptr, &norm_dst_ptr, &split_ptr, &mix_ptr,
+                &L.hc_ffn_scale, &L.hc_ffn_base, &x_ptr, &L.ffn_norm,
+                &n_embd_v, &sinkhorn_iters, &eps, &norm_eps,
+            };
+            DS4_CUDA_LAUNCH(g->hc4_split_weighted_sum_norm_f32, 1, 1, 1, 256, 1, 1, 0, args);
+            DS4_CUDA_SYNC();
+        }
+
+        /* Router: matvec_f16 logits, then either hash routing or topk. */
+        if (!cuda_eval_launch_matvec_f16(g, g->eval_router_logits, L.ffn_gate_inp, g->eval_ffn_norm,
+                                         DS4_N_EMBD, DS4_N_EXPERT, err, errlen)) return false;
+        if (L.has_hash_router) {
+            uint64_t probs_ptr = ds4_cuda_tensor_device_ptr(g->eval_router_probs);
+            uint64_t selected_ptr = ds4_cuda_tensor_device_ptr(g->eval_router_selected);
+            uint64_t weights_ptr = ds4_cuda_tensor_device_ptr(g->eval_router_weights);
+            uint64_t logits_ptr = ds4_cuda_tensor_device_ptr(g->eval_router_logits);
+            uint32_t n_vocab = (uint32_t)weights->token_embd->dim[1];
+            uint32_t n_expert = DS4_N_EXPERT;
+            uint32_t n_used = DS4_N_EXPERT_USED;
+            uint32_t token_u32 = (uint32_t)token;
+            float weight_scale = DS4_EXPERT_WEIGHT_SCALE;
+            void *args[] = {
+                &probs_ptr, &selected_ptr, &weights_ptr, &logits_ptr, &L.ffn_gate_tid2eid,
+                &token_u32, &n_vocab, &n_expert, &n_used, &weight_scale,
+            };
+            DS4_CUDA_LAUNCH(g->router_hash_select_f32, 1, 1, 1, 256, 1, 1, 0, args);
+            DS4_CUDA_SYNC();
+        } else {
+            if (!cuda_eval_launch_router_probs(g, g->eval_router_probs, g->eval_router_logits,
+                                               DS4_N_EXPERT, err, errlen)) return false;
+            uint64_t bias_ptr = L.has_exp_probs_b ? L.ffn_exp_probs_b : 0;
+            if (!cuda_eval_launch_router_topk(g, g->eval_router_selected, g->eval_router_weights,
+                                              g->eval_router_probs, bias_ptr,
+                                              DS4_N_EXPERT, DS4_N_EXPERT_USED, err, errlen)) return false;
+        }
+
+        /* Routed iq2 swiglu. */
+        {
+            uint64_t mid_ptr = ds4_cuda_tensor_device_ptr(g->eval_routed_mid);
+            uint64_t x_ptr = ds4_cuda_tensor_device_ptr(g->eval_ffn_norm);
+            uint64_t selected_ptr = ds4_cuda_tensor_device_ptr(g->eval_router_selected);
+            uint64_t weights_ptr = ds4_cuda_tensor_device_ptr(g->eval_router_weights);
+            uint32_t in_dim = DS4_N_EMBD;
+            uint32_t mid_dim = DS4_N_FF_EXP;
+            uint32_t n_used = DS4_N_EXPERT_USED;
+            float clamp = DS4_SWIGLU_CLAMP_EXP;
+            void *args[] = {
+                &mid_ptr, &L.ffn_gate_exps, &L.ffn_up_exps, &x_ptr,
+                &selected_ptr, &weights_ptr,
+                &in_dim, &mid_dim, &n_used,
+                &L.gate_expert_bytes, &L.gate_row_bytes,
+                &L.up_expert_bytes, &L.up_row_bytes,
+                &clamp,
+            };
+            DS4_CUDA_LAUNCH(g->routed_iq2_swiglu_f32, mid_dim, n_used, 1, 1, 1, 1, 0, args);
+            DS4_CUDA_SYNC();
+        }
+
+        /* Routed q2_k down sum into eval_routed_out. */
+        {
+            uint64_t out_ptr = ds4_cuda_tensor_device_ptr(g->eval_routed_out);
+            uint64_t mid_ptr = ds4_cuda_tensor_device_ptr(g->eval_routed_mid);
+            uint64_t selected_ptr = ds4_cuda_tensor_device_ptr(g->eval_router_selected);
+            uint32_t in_dim = DS4_N_FF_EXP;
+            uint32_t out_dim = DS4_N_EMBD;
+            uint32_t n_used = DS4_N_EXPERT_USED;
+            void *args[] = {
+                &out_ptr, &L.ffn_down_exps, &mid_ptr, &selected_ptr,
+                &in_dim, &out_dim, &n_used,
+                &L.down_expert_bytes, &L.down_row_bytes,
+            };
+            DS4_CUDA_LAUNCH(g->routed_q2_down_sum_f32, out_dim, 1, 1, 1, 1, 1, 0, args);
+            DS4_CUDA_SYNC();
+        }
+
+        /* Shared expert: gate, up, swiglu (no clamp for shared), down. */
+        if (!cuda_eval_launch_matvec_q8_0(g, g->eval_shared_gate, L.ffn_gate_shexp, g->eval_ffn_norm,
+                                          DS4_N_EMBD, DS4_N_FF_EXP, err, errlen)) return false;
+        if (!cuda_eval_launch_matvec_q8_0(g, g->eval_shared_up, L.ffn_up_shexp, g->eval_ffn_norm,
+                                          DS4_N_EMBD, DS4_N_FF_EXP, err, errlen)) return false;
+        if (!cuda_eval_launch_swiglu(g, g->eval_shared_mid, g->eval_shared_gate, g->eval_shared_up,
+                                     DS4_N_FF_EXP, 0.0f, err, errlen)) return false;
+        if (!cuda_eval_launch_matvec_q8_0(g, g->eval_shared_out, L.ffn_down_shexp, g->eval_shared_mid,
+                                          DS4_N_FF_EXP, DS4_N_EMBD, err, errlen)) return false;
+
+        /* Add routed + shared into eval_ffn_out. */
+        if (!cuda_eval_launch_add(g, g->eval_ffn_out, g->eval_routed_out, g->eval_shared_out,
+                                  DS4_N_EMBD, err, errlen)) return false;
+
+        /* HC post for FFN: write into next_hc. */
+        {
+            uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(next_hc);
+            uint64_t block_ptr = ds4_cuda_tensor_device_ptr(g->eval_ffn_out);
+            uint64_t residual_ptr = ds4_cuda_tensor_device_ptr(g->eval_after_attn_hc);
+            uint64_t split_ptr = ds4_cuda_tensor_device_ptr(g->eval_ffn_hc_split);
+            uint32_t n_embd_v = DS4_N_EMBD;
+            void *args[] = { &dst_ptr, &block_ptr, &residual_ptr, &split_ptr, &n_embd_v };
+            const uint32_t block = 256;
+            const uint32_t grid = (n_embd_v + block - 1u) / block;
+            DS4_CUDA_LAUNCH(g->hc4_post_f32, grid, 1, 1, block, 1, 1, 0, args);
+            DS4_CUDA_SYNC();
+        }
+
+        /* Swap cur_hc and next_hc for next layer. */
+        ds4_cuda_tensor *tmp = cur_hc;
+        cur_hc = next_hc;
+        next_hc = tmp;
+    }
+
+    /* --- Output head: HC pre (no weight) -> matvec_f16 (output_hc_fn) ->
+     * sigmoid weights -> weighted sum -> rms-with-weight (output_norm) ->
+     * matvec_q8_0 (output) into g->logits. --- */
+    uint64_t output_hc_fn_ptr = 0, output_hc_scale_ptr = 0, output_hc_base_ptr = 0;
+    uint64_t output_norm_ptr = 0, output_ptr = 0;
+    if (!cuda_graph_tensor_device_ptr(g, model, weights->output_hc_fn, &output_hc_fn_ptr, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, weights->output_hc_scale, &output_hc_scale_ptr, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, weights->output_hc_base, &output_hc_base_ptr, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, weights->output_norm, &output_norm_ptr, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, weights->output, &output_ptr, err, errlen))
+    {
+        return false;
+    }
+    if (!cuda_eval_launch_rms_general(g, g->eval_flat_hc, cur_hc, 0, hc_dim, false, err, errlen)) return false;
+    if (!cuda_eval_launch_matvec_f16(g, g->eval_output_pre, output_hc_fn_ptr, g->eval_flat_hc, hc_dim, DS4_N_HC, err, errlen)) return false;
+    if (!cuda_eval_launch_output_hc_weights(g, g->eval_output_weights, g->eval_output_pre,
+                                            output_hc_scale_ptr, output_hc_base_ptr,
+                                            DS4_N_HC, DS4_HC_EPS, err, errlen)) return false;
+    if (!cuda_eval_launch_output_hc_weighted_sum(g, g->eval_output_embd, cur_hc, g->eval_output_weights,
+                                                 DS4_N_EMBD, DS4_N_HC, err, errlen)) return false;
+    if (!cuda_eval_launch_rms_general(g, g->eval_output_norm, g->eval_output_embd, output_norm_ptr,
+                                      DS4_N_EMBD, true, err, errlen)) return false;
+    if (!cuda_eval_launch_matvec_q8_0(g, g->logits, output_ptr, g->eval_output_norm,
+                                      DS4_N_EMBD, DS4_N_VOCAB, err, errlen)) return false;
+    return true;
+}
+
+/* Reset all per-layer KV cache counters (used when prompt does not match checkpoint). */
+static void cuda_graph_reset_layer_caches(ds4_cuda_graph *g) {
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_cache[il].n_raw = 0;
+        g->layer_cache[il].n_comp = 0;
+        g->layer_cache[il].n_index_comp = 0;
+    }
+}
+
+/* Forward-declared; defined after ds4_session is fully visible. */
+static bool cuda_session_eval_token(ds4_session *s, int token, char *err, size_t errlen);
+static bool cuda_graph_prefill_loop(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+
 static bool cuda_graph_alloc(ds4_cuda_graph *g,
                              const ds4_model *model,
                              uint32_t ctx_size,
@@ -14389,6 +15393,82 @@ static bool cuda_graph_alloc(ds4_cuda_graph *g,
     g->probe_router_weights = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
     g->probe_after_ffn_hc = ds4_cuda_tensor_alloc(hc_bytes);
 
+    /* Per-token activation tensors for the full executor. */
+    g->eval_attn_norm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->eval_qr = ds4_cuda_tensor_alloc((uint64_t)DS4_N_LORA_Q * sizeof(float));
+    g->eval_qr_norm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_LORA_Q * sizeof(float));
+    g->eval_q = ds4_cuda_tensor_alloc(q_dim * sizeof(float));
+    g->eval_kv_raw = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+    g->eval_kv = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+    g->eval_heads = ds4_cuda_tensor_alloc(q_dim * sizeof(float));
+    g->eval_attn_low = ds4_cuda_tensor_alloc(attn_low * sizeof(float));
+    g->eval_attn_out = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->eval_after_attn_hc = ds4_cuda_tensor_alloc(hc_bytes);
+    g->eval_attn_cur = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->eval_hc_mix = ds4_cuda_tensor_alloc(hc_mix * sizeof(float));
+    g->eval_hc_split = ds4_cuda_tensor_alloc(hc_mix * sizeof(float));
+    g->eval_flat_hc = ds4_cuda_tensor_alloc(hc_bytes);
+    g->eval_ffn_cur = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->eval_ffn_norm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->eval_ffn_hc_mix = ds4_cuda_tensor_alloc(hc_mix * sizeof(float));
+    g->eval_ffn_hc_split = ds4_cuda_tensor_alloc(hc_mix * sizeof(float));
+    g->eval_shared_gate = ds4_cuda_tensor_alloc((uint64_t)DS4_N_FF_EXP * sizeof(float));
+    g->eval_shared_up = ds4_cuda_tensor_alloc((uint64_t)DS4_N_FF_EXP * sizeof(float));
+    g->eval_shared_mid = ds4_cuda_tensor_alloc((uint64_t)DS4_N_FF_EXP * sizeof(float));
+    g->eval_shared_out = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->eval_routed_mid = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+    g->eval_routed_out = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->eval_ffn_out = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->eval_router_logits = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    g->eval_router_probs = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    g->eval_router_selected = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+    g->eval_router_weights = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+    g->eval_comp = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+    g->eval_index_comp = ds4_cuda_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    g->eval_index_q = ds4_cuda_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    g->eval_index_weights = ds4_cuda_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
+    g->eval_index_scores = ds4_cuda_tensor_alloc((uint64_t)g->comp_cap * sizeof(float));
+    g->eval_index_allowed = ds4_cuda_tensor_alloc((uint64_t)g->comp_cap * sizeof(uint32_t));
+    g->eval_output_pre = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
+    g->eval_output_weights = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
+    g->eval_output_embd = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->eval_output_norm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+
+    /* Per-layer KV cache. */
+    bool layer_alloc_ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && layer_alloc_ok; il++) {
+        ds4_cuda_layer_cache *lc = &g->layer_cache[il];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        lc->n_raw = 0;
+        lc->n_comp = 0;
+        lc->n_index_comp = 0;
+        lc->coff = (ratio == 4u) ? 2u : 1u;
+        lc->state_rows = (ratio == 4u) ? 2u * ratio : ratio;
+        lc->comp_cap = ratio == 0 ? 0 : (ctx_size / ratio + 2u);
+        lc->raw_kv = ds4_cuda_tensor_alloc((uint64_t)g->raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        layer_alloc_ok = layer_alloc_ok && lc->raw_kv != NULL;
+        if (ratio != 0) {
+            const uint64_t state_w = (uint64_t)lc->coff * DS4_N_HEAD_DIM;
+            lc->attn_comp_kv = ds4_cuda_tensor_alloc((uint64_t)lc->comp_cap * DS4_N_HEAD_DIM * sizeof(float));
+            lc->attn_state_kv = ds4_cuda_tensor_alloc((uint64_t)lc->state_rows * state_w * sizeof(float));
+            lc->attn_state_score = ds4_cuda_tensor_alloc((uint64_t)lc->state_rows * state_w * sizeof(float));
+            layer_alloc_ok = layer_alloc_ok &&
+                             lc->attn_comp_kv != NULL &&
+                             lc->attn_state_kv != NULL &&
+                             lc->attn_state_score != NULL;
+        }
+        if (ratio == 4u) {
+            const uint64_t istate_w = (uint64_t)lc->coff * DS4_N_INDEXER_HEAD_DIM;
+            lc->index_comp_kv = ds4_cuda_tensor_alloc((uint64_t)lc->comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+            lc->index_state_kv = ds4_cuda_tensor_alloc((uint64_t)lc->state_rows * istate_w * sizeof(float));
+            lc->index_state_score = ds4_cuda_tensor_alloc((uint64_t)lc->state_rows * istate_w * sizeof(float));
+            layer_alloc_ok = layer_alloc_ok &&
+                             lc->index_comp_kv != NULL &&
+                             lc->index_state_kv != NULL &&
+                             lc->index_state_score != NULL;
+        }
+    }
+
     const bool ok = g->tokens && g->cur_hc && g->next_hc && g->logits &&
                     g->probe_flat_hc && g->probe_hc_mix && g->probe_hc_split &&
                     g->probe_attn_cur && g->probe_attn_norm &&
@@ -14402,7 +15482,22 @@ static bool cuda_graph_alloc(ds4_cuda_graph *g,
                     g->probe_routed_mid && g->probe_routed_out && g->probe_ffn_out &&
                     g->probe_router_logits && g->probe_router_probs &&
                     g->probe_router_selected && g->probe_router_weights &&
-                    g->probe_after_ffn_hc;
+                    g->probe_after_ffn_hc &&
+                    g->eval_attn_norm && g->eval_qr && g->eval_qr_norm && g->eval_q &&
+                    g->eval_kv_raw && g->eval_kv && g->eval_heads && g->eval_attn_low &&
+                    g->eval_attn_out && g->eval_after_attn_hc && g->eval_attn_cur &&
+                    g->eval_hc_mix && g->eval_hc_split && g->eval_flat_hc &&
+                    g->eval_ffn_cur && g->eval_ffn_norm &&
+                    g->eval_ffn_hc_mix && g->eval_ffn_hc_split &&
+                    g->eval_shared_gate && g->eval_shared_up && g->eval_shared_mid && g->eval_shared_out &&
+                    g->eval_routed_mid && g->eval_routed_out && g->eval_ffn_out &&
+                    g->eval_router_logits && g->eval_router_probs &&
+                    g->eval_router_selected && g->eval_router_weights &&
+                    g->eval_comp && g->eval_index_comp && g->eval_index_q &&
+                    g->eval_index_weights && g->eval_index_scores && g->eval_index_allowed &&
+                    g->eval_output_pre && g->eval_output_weights &&
+                    g->eval_output_embd && g->eval_output_norm &&
+                    layer_alloc_ok;
     if (!ok) {
         snprintf(err, errlen, "CUDA device allocation failed");
         cuda_graph_free(g);
@@ -15684,6 +16779,42 @@ struct ds4_session {
 };
 
 #ifndef DS4_NO_CUDA
+static bool cuda_session_eval_token(ds4_session *s, int token, char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    if (!cuda_graph_eval_token(&s->cuda_graph, &e->model, &e->weights, token,
+                               (uint32_t)s->checkpoint.len, err, errlen)) {
+        return false;
+    }
+    if (!ds4_cuda_tensor_read(s->cuda_graph.logits, 0, s->logits,
+                              (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+        snprintf(err, errlen, "CUDA logits readback failed");
+        return false;
+    }
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    return true;
+}
+
+static bool cuda_graph_prefill_loop(ds4_session *s, const ds4_tokens *prompt,
+                                    char *err, size_t errlen) {
+    cuda_graph_reset_layer_caches(&s->cuda_graph);
+    for (int i = 0; i < prompt->len; i++) {
+        if (!cuda_graph_eval_token(&s->cuda_graph, &s->engine->model, &s->engine->weights,
+                                   prompt->v[i], (uint32_t)i, err, errlen)) return false;
+        if (s->progress) s->progress(s->progress_ud, "prefill", i + 1, prompt->len);
+    }
+    if (!ds4_cuda_tensor_read(s->cuda_graph.logits, 0, s->logits,
+                              (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+        snprintf(err, errlen, "CUDA logits readback failed at end of prefill");
+        return false;
+    }
+    ds4_tokens_copy(&s->checkpoint, prompt);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    return true;
+}
+
 static bool cuda_session_cpu_bridge_reset(ds4_session *s, char *err, size_t errlen) {
     if (!s || !s->engine) {
         snprintf(err, errlen, "CUDA CPU bridge session is invalid");
@@ -15711,8 +16842,10 @@ static bool cuda_session_cpu_bridge_prefill(ds4_session *s,
     if (!cuda_session_cpu_bridge_reset(s, err, errlen)) return false;
 
     ds4_engine *e = s->engine;
-    fprintf(stderr,
-            "ds4: CUDA graph is incomplete; using CPU reference bridge for full prefill/decode\n");
+    if (getenv("DS4_CUDA_BRIDGE") != NULL) {
+        fprintf(stderr,
+                "ds4: DS4_CUDA_BRIDGE set; using CPU reference bridge for full prefill/decode\n");
+    }
     const double t0 = now_sec();
     prefill_layer_major_cpu(s->logits, &e->model, &e->weights, &s->cuda_cpu_cache, prompt);
     const double t1 = now_sec();
@@ -16458,10 +17591,51 @@ int ds4_engine_generate_argmax(
     }
 
     if (e->backend == DS4_BACKEND_CUDA) {
-        fprintf(stderr,
-                "ds4: CUDA graph generation is incomplete; using CPU reference bridge for argmax generation\n");
-        return generate_raw_swa_cpu(model, vocab, weights, prompt, n_predict,
-                                    ctx_size, emit, done, emit_ud, progress, progress_ud);
+        if (getenv("DS4_CUDA_BRIDGE") != NULL) {
+            fprintf(stderr,
+                    "ds4: DS4_CUDA_BRIDGE set; using CPU reference bridge for argmax generation\n");
+            return generate_raw_swa_cpu(model, vocab, weights, prompt, n_predict,
+                                        ctx_size, emit, done, emit_ud, progress, progress_ud);
+        }
+        /* Session-driven CUDA generation: sync(prompt) does prefill on GPU,
+         * then loop sample/eval through the executor. Matches the server. */
+        ds4_session *s = NULL;
+        if (ds4_session_create(&s, e, ctx_size) != 0 || !s) {
+            fprintf(stderr, "ds4: CUDA session_create failed\n");
+            return 1;
+        }
+        ds4_session_set_progress(s, progress, progress_ud);
+        char err[512];
+        const double t_prefill0 = now_sec();
+        if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: CUDA session_sync failed: %s\n", err);
+            ds4_session_free(s);
+            return 1;
+        }
+        const double t_prefill1 = now_sec();
+        const double t_decode0 = now_sec();
+        int n_generated = 0;
+        for (int i = 0; i < n_predict; i++) {
+            int token = ds4_session_argmax(s);
+            if (token == vocab->eos_id) break;
+            if (emit) emit(emit_ud, token);
+            n_generated++;
+            if (i == n_predict - 1) break;
+            if (ds4_session_eval(s, token, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4: CUDA session_eval failed: %s\n", err);
+                break;
+            }
+        }
+        const double t_decode1 = now_sec();
+        if (done) done(emit_ud);
+        const double prefill_s = t_prefill1 - t_prefill0;
+        const double decode_s = t_decode1 - t_decode0;
+        ds4_timing_printf(
+                "ds4: cuda prefill: %.2f t/s, generation: %.2f t/s\n",
+                prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
+                decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
+        ds4_session_free(s);
+        return 0;
     }
 
     return generate_raw_swa_cpu(model, vocab, weights, prompt, n_predict,
@@ -16748,8 +17922,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 info.name,
                 (double)info.free_mem / (1024.0 * 1024.0 * 1024.0),
                 (double)info.total_mem / (1024.0 * 1024.0 * 1024.0));
-        fprintf(stderr,
-                "ds4: CUDA graph executor is not implemented yet; model loading and runtime probing are available only\n");
+        if (getenv("DS4_CUDA_BRIDGE") != NULL) {
+            fprintf(stderr,
+                    "ds4: CUDA graph executor disabled by DS4_CUDA_BRIDGE; using CPU reference bridge\n");
+        } else {
+            fprintf(stderr, "ds4: CUDA graph executor ready (full per-token decode path)\n");
+        }
 #endif
     }
 
@@ -16908,6 +18086,29 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             snprintf(err, errlen, "prompt exceeds context");
             return 1;
         }
+        const bool use_bridge = getenv("DS4_CUDA_BRIDGE") != NULL;
+        if (!use_bridge) {
+            /* GPU executor path. */
+            if (s->checkpoint_valid &&
+                prompt->len >= s->checkpoint.len &&
+                ds4_tokens_starts_with(prompt, &s->checkpoint))
+            {
+                for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                    if (!cuda_session_eval_token(s, prompt->v[i], err, errlen)) {
+                        s->checkpoint_valid = false;
+                        return 1;
+                    }
+                    if (s->progress) s->progress(s->progress_ud, "decode", i + 1, prompt->len);
+                }
+                return 0;
+            }
+            if (!cuda_graph_prefill_loop(s, prompt, err, errlen)) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            return 0;
+        }
+        /* DS4_CUDA_BRIDGE=1 fallback path (CPU reference). */
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -17102,6 +18303,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #ifndef DS4_NO_CUDA
     if (s && s->engine && s->engine->backend == DS4_BACKEND_CUDA) {
         (void)probe_mtp;
+        const bool use_bridge = getenv("DS4_CUDA_BRIDGE") != NULL;
+        if (!use_bridge) {
+            if (!cuda_session_eval_token(s, token, err, errlen)) return 1;
+            return 0;
+        }
         if (!cuda_session_cpu_bridge_eval(s, token, err, errlen)) return 1;
         return 0;
     }
