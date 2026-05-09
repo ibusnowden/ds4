@@ -1,0 +1,30 @@
+{
+  "name": "pi-ds4-provider",
+  "version": "0.1.0",
+  "description": "Pi provider extension for local ds4.c DeepSeek V4 Flash inference.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ds4",
+    "deepseek"
+  ],
+  "pi": {
+    "extensions": [
+      "./pi-sd4-provider.ts"
+    ],
+    "skills": [
+      "./skills/plan-first"
+    ]
+  },
+  "files": [
+    "pi-sd4-provider.ts",
+    "ds4-watchdog.sh",
+    "install-pi-extension-local.sh",
+    "skills/plan-first/SKILL.md",
+    "start-ds4-pi.sh",
+    "serve-slurm-rtx.sh",
+    "endpoint.sh",
+    "connect.sh"
+  ]
+}
