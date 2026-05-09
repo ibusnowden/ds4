@@ -239,33 +239,29 @@ disk KV cache, `./logs/current-ds4.env` for the active endpoint, and
 `./logs/benchmarks/` for benchmark JSON.
 
 The CUDA backend is an explicit engine target now, but the CUDA graph executor
-still has to be implemented before RTX inference can run. Until then, the CUDA
-path loads the CUDA driver, reports the selected GPU and memory, then fails at
-prefill/decode with a clear graph-executor message instead of silently falling
-back to CPU. CUDA session allocation, device tensors, copies, module loading,
-kernel launch wrappers, NVRTC source loading, device-mapped GGUF tensor-data
-registration, and the first device kernels (clear, token embedding into HC
-state, F16 matvec, Q8_0 matvec, HC=4 split/weighted-sum+RMSNorm, RMSNorm,
-head RMSNorm, RoPE tail, one-row sink-aware attention, grouped Q8_0 attention
-output, HC=4 post, SwiGLU, hash router select/weighting, row softmax, and
-argmax) are present for the executor port.
+still has to be implemented before RTX inference is GPU-resident. CUDA sessions
+now return real logits by using the complete 43-layer CPU reference bridge for
+prefill/decode while the CUDA graph port continues. This keeps the OpenAI server
+and Pi usable on RTX allocations, but any reported tok/s from this bridge is CPU
+reference throughput, not CUDA graph throughput. CUDA session allocation, device
+tensors, copies, module loading, kernel launch wrappers, NVRTC source loading,
+device-mapped GGUF tensor-data registration, and the first device kernels
+(clear, token embedding into HC state, F16 matvec, Q8_0 matvec, HC=4
+split/weighted-sum+RMSNorm, RMSNorm, head RMSNorm, RoPE tail, one-row
+sink-aware attention, grouped Q8_0 attention output, HC=4 post, SwiGLU, routed
+IQ2_XXS gate/up, Q2_K down accumulation, hash router select/weighting, row
+softmax, and argmax) are present for the executor port.
 A CUDA session now requires `libnvrtc` so those kernels can be compiled and
 loaded without adding a build-time CUDA toolkit dependency.
 
 `./start-ds4-pi.sh --cuda-smoke` submits a short Slurm job that validates the
 CUDA allocation, model mapping, driver initialization, CUDA session scratch
 allocation, GGUF tensor-data host registration, NVRTC kernel compilation,
-module load, and a trivial kernel launch. A CUDA prompt sync additionally probes
-real model-weight reads through token embedding plus the semantic layer-0
-attention pre/Q/KV path: F16 HC mix matvec, HC split/sinkhorn, HC weighted sum,
-attention RMSNorm, Q8_0 Q/KV matvecs, head RMSNorm, Q/KV RoPE, raw KV store,
-one-row attention, inverse head RoPE, grouped attention output, and HC post
-followed by the layer-0 FFN side through FFN HC split/sinkhorn/norm, hash-router
-logits/selected weights, shared-expert SwiGLU, shared down projection, and FFN HC
-post before stopping at the remaining graph-executor boundary. It writes
-`./logs/cuda-smoke-<jobid>.log`. This is the right RTX test until the DS4 CUDA
-kernels are wired into the layer graph; chat tok/s remains blocked by the
-missing full graph executor.
+module load, and a trivial kernel launch. Set `DS4_CUDA_LAYER0_PROBE=1` during
+prompt sync to also probe real model-weight reads through the semantic layer-0
+attention and FFN CUDA primitives. It writes `./logs/cuda-smoke-<jobid>.log`.
+Real chat currently runs through the CPU reference bridge; CUDA graph tok/s
+remains blocked by the missing full graph executor.
 
 #### RTX benchmark log
 

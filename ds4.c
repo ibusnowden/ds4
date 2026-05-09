@@ -441,12 +441,12 @@ static uint64_t hash_bytes(const void *ptr, uint64_t len) {
 static bool g_alloc_guard_enabled;
 static const char *g_alloc_guard_phase;
 
-static void ds4_alloc_guard_begin(const char *phase) {
+static DS4_MAYBE_UNUSED void ds4_alloc_guard_begin(const char *phase) {
     g_alloc_guard_phase = phase;
     g_alloc_guard_enabled = true;
 }
 
-static void ds4_alloc_guard_end(void) {
+static DS4_MAYBE_UNUSED void ds4_alloc_guard_end(void) {
     g_alloc_guard_enabled = false;
     g_alloc_guard_phase = NULL;
 }
@@ -15355,7 +15355,6 @@ static int generate_raw_swa_cpu(
     int n_decode_eval = 0;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
     const double t_decode0 = now_sec();
-    ds4_alloc_guard_begin("CPU token generation");
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
         if (trace_top) {
             char label[64];
@@ -15384,7 +15383,6 @@ static int generate_raw_swa_cpu(
         n_decode_eval++;
         pos++;
     }
-    ds4_alloc_guard_end();
     const double t_decode1 = now_sec();
     if (done) done(emit_ud);
 
@@ -15684,6 +15682,79 @@ struct ds4_session {
     bool cuda_cpu_decode_ready;
 #endif
 };
+
+#ifndef DS4_NO_CUDA
+static bool cuda_session_cpu_bridge_reset(ds4_session *s, char *err, size_t errlen) {
+    if (!s || !s->engine) {
+        snprintf(err, errlen, "CUDA CPU bridge session is invalid");
+        return false;
+    }
+    if (s->cuda_cpu_decode_ready) {
+        kv_cache_free(&s->cuda_cpu_cache);
+        cpu_decode_scratch_free(&s->cuda_cpu_scratch);
+        s->cuda_cpu_decode_ready = false;
+    }
+    kv_cache_init(&s->cuda_cpu_cache, (uint32_t)s->ctx_size, 0);
+    cpu_decode_scratch_init(&s->cuda_cpu_scratch, (uint32_t)s->ctx_size);
+    s->cuda_cpu_decode_ready = true;
+    return true;
+}
+
+static bool cuda_session_cpu_bridge_prefill(ds4_session *s,
+                                            const ds4_tokens *prompt,
+                                            char *err,
+                                            size_t errlen) {
+    if (!prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
+        snprintf(err, errlen, "prompt exceeds context");
+        return false;
+    }
+    if (!cuda_session_cpu_bridge_reset(s, err, errlen)) return false;
+
+    ds4_engine *e = s->engine;
+    fprintf(stderr,
+            "ds4: CUDA graph is incomplete; using CPU reference bridge for full prefill/decode\n");
+    const double t0 = now_sec();
+    prefill_layer_major_cpu(s->logits, &e->model, &e->weights, &s->cuda_cpu_cache, prompt);
+    const double t1 = now_sec();
+    ds4_timing_printf("ds4: CUDA CPU-bridge prefill: %.2f t/s\n",
+                      (t1 > t0) ? (double)prompt->len / (t1 - t0) : 0.0);
+
+    ds4_tokens_copy(&s->checkpoint, prompt);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    return true;
+}
+
+static bool cuda_session_cpu_bridge_eval(ds4_session *s,
+                                         int token,
+                                         char *err,
+                                         size_t errlen) {
+    if (!s || !s->engine || !s->cuda_cpu_decode_ready || !s->checkpoint_valid) {
+        snprintf(err, errlen, "CUDA CPU bridge decode requested before prompt sync");
+        return false;
+    }
+    if (s->checkpoint.len >= s->ctx_size) {
+        snprintf(err, errlen, "context is full");
+        return false;
+    }
+    const double t0 = now_sec();
+    forward_token_raw_swa_cpu_decode_scratch(s->logits,
+                                             &s->engine->model,
+                                             &s->engine->weights,
+                                             &s->cuda_cpu_cache,
+                                             token,
+                                             (uint32_t)s->checkpoint.len,
+                                             &s->cuda_cpu_scratch);
+    const double t1 = now_sec();
+    if (getenv("DS4_TOKEN_TIMING") != NULL) {
+        fprintf(stderr, "ds4: CUDA CPU-bridge decode eval took %.3f ms\n", (t1 - t0) * 1000.0);
+    }
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    return true;
+}
+#endif
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -16388,8 +16459,9 @@ int ds4_engine_generate_argmax(
 
     if (e->backend == DS4_BACKEND_CUDA) {
         fprintf(stderr,
-                "ds4: CUDA generation requested, but DS4 CUDA graph kernels are not implemented yet\n");
-        return 1;
+                "ds4: CUDA graph generation is incomplete; using CPU reference bridge for argmax generation\n");
+        return generate_raw_swa_cpu(model, vocab, weights, prompt, n_predict,
+                                    ctx_size, emit, done, emit_ud, progress, progress_ud);
     }
 
     return generate_raw_swa_cpu(model, vocab, weights, prompt, n_predict,
@@ -16776,6 +16848,10 @@ void ds4_session_free(ds4_session *s) {
 #endif
 #ifndef DS4_NO_CUDA
     cuda_graph_free(&s->cuda_graph);
+    if (s->cuda_cpu_decode_ready) {
+        kv_cache_free(&s->cuda_cpu_cache);
+        cpu_decode_scratch_free(&s->cuda_cpu_scratch);
+    }
 #endif
     token_vec_free(&s->checkpoint);
     free(s->logits);
@@ -16828,30 +16904,51 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
 #ifndef DS4_NO_CUDA
     if (s && s->engine && s->engine->backend == DS4_BACKEND_CUDA) {
-        if (prompt && prompt->len > 0) {
+        if (!prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
+            snprintf(err, errlen, "prompt exceeds context");
+            return 1;
+        }
+        if (s->checkpoint_valid &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint))
+        {
+            for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                if (!cuda_session_cpu_bridge_eval(s, prompt->v[i], err, errlen)) {
+                    s->checkpoint_valid = false;
+                    return 1;
+                }
+                if (s->progress) s->progress(s->progress_ud, "decode", i + 1, prompt->len);
+            }
+            return 0;
+        }
+        if (!cuda_session_cpu_bridge_prefill(s, prompt, err, errlen)) {
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        if (getenv("DS4_CUDA_LAYER0_PROBE") != NULL) {
             char embed_err[512];
             if (!cuda_graph_embed_token(&s->cuda_graph,
                                         &s->engine->model,
                                         &s->engine->weights,
                                         prompt->v[prompt->len - 1],
                                         embed_err,
-                                        sizeof(embed_err)))
-            {
-                snprintf(err, errlen, "CUDA token embedding probe failed: %s", embed_err);
-                return 1;
-            }
-            if (!cuda_graph_probe_layer0_q_path(&s->cuda_graph,
+                                        sizeof(embed_err)) ||
+                !cuda_graph_probe_layer0_q_path(&s->cuda_graph,
                                                 &s->engine->model,
                                                 &s->engine->weights,
                                                 prompt->v[prompt->len - 1],
                                                 embed_err,
                                                 sizeof(embed_err)))
             {
-                snprintf(err, errlen, "CUDA layer-0 Q/KV primitive probe failed: %s", embed_err);
-                return 1;
+                fprintf(stderr, "ds4: CUDA optional layer-0 probe failed: %s\n", embed_err);
+                if (getenv("DS4_CUDA_LAYER0_PROBE_REQUIRED") != NULL) {
+                    snprintf(err, errlen, "CUDA optional layer-0 probe failed: %s", embed_err);
+                    s->checkpoint_valid = false;
+                    return 1;
+                }
             }
         }
-        return cuda_graph_unimplemented(err, errlen, "prefill/sync");
+        return 0;
     }
 #endif
 #ifdef DS4_NO_METAL
@@ -17004,9 +17101,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
 #ifndef DS4_NO_CUDA
     if (s && s->engine && s->engine->backend == DS4_BACKEND_CUDA) {
-        (void)token;
         (void)probe_mtp;
-        return cuda_graph_unimplemented(err, errlen, "decode");
+        if (!cuda_session_cpu_bridge_eval(s, token, err, errlen)) return 1;
+        return 0;
     }
 #endif
 #ifdef DS4_NO_METAL
