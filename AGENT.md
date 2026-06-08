@@ -124,8 +124,12 @@ bug, not a real measurement.
    unified addressing — no kernel changes).  Correctness verified (full 43/43
    residency, byte-identical greedy output).  **Payoff is gated by interconnect
    bandwidth**: on 2× RTX 6000 Ada (PCIe P2P 26.7 GB/s ≈ host 24.2 GB/s) it is a
-   wash (9.26 vs 9.69 t/s); the win needs NVLink (H100, ~30× host PCIe).  See
-   BASELINE.md "2026-06-08".  Opt out with `DS4_CUDA_NO_PEER=1`.
+   wash (9.26 vs 9.69 t/s), but on 2× H100 (NV18 NVLink, ~30× host PCIe) moving
+   32 overflow layers off the PCIe path is **1.84× decode (7.34 → 13.54 t/s)** at
+   equal device-0 budget, and full residency beats single-GPU partial residency
+   (12.29 t/s).  See BASELINE.md "2026-06-08".  Opt out with `DS4_CUDA_NO_PEER=1`.
+   NVRTC arch now auto-detects the device CC (H100 needs sm_90; the old fixed
+   sm_89 default gave "invalid device kernel image"); override `DS4_CUDA_ARCH`.
 
 ### Key insight (settled 2026-06-08)
 

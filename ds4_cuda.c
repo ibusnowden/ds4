@@ -22,6 +22,7 @@ typedef int (*cuDeviceGetCount_fn)(int *count);
 typedef int (*cuDeviceGet_fn)(CUdevice *device, int ordinal);
 typedef int (*cuDeviceGetName_fn)(char *name, int len, CUdevice dev);
 typedef int (*cuDeviceTotalMem_fn)(size_t *bytes, CUdevice dev);
+typedef int (*cuDeviceGetAttribute_fn)(int *pi, int attrib, CUdevice dev);
 typedef int (*cuCtxCreate_fn)(CUcontext *pctx, unsigned int flags, CUdevice dev);
 typedef int (*cuCtxDestroy_fn)(CUcontext ctx);
 typedef int (*cuCtxSetCurrent_fn)(CUcontext ctx);
@@ -111,6 +112,13 @@ static CUcontext g_peer_ctx;
 static CUdevice  g_peer_dev = -1;
 static bool      g_peer_ready;
 
+/* Device 0 compute capability, queried at init; used to default the NVRTC
+ * --gpu-architecture so kernels JIT for the actual GPU (sm_89 RTX 6000 Ada,
+ * sm_90 H100, ...).  A fixed default produced "invalid device kernel image"
+ * when the runtime GPU differed from the build-time guess. */
+static int g_cc_major;
+static int g_cc_minor;
+
 static cuInit_fn p_cuInit;
 static cuDeviceGetCount_fn p_cuDeviceGetCount;
 static cuDeviceGet_fn p_cuDeviceGet;
@@ -119,6 +127,7 @@ static cuDeviceTotalMem_fn p_cuDeviceTotalMem;
 static cuCtxCreate_fn p_cuCtxCreate;
 static cuCtxDestroy_fn p_cuCtxDestroy;
 static cuCtxSetCurrent_fn p_cuCtxSetCurrent;
+static cuDeviceGetAttribute_fn p_cuDeviceGetAttribute;
 static cuDeviceCanAccessPeer_fn p_cuDeviceCanAccessPeer;
 static cuCtxEnablePeerAccess_fn p_cuCtxEnablePeerAccess;
 static cuMemGetInfo_fn p_cuMemGetInfo;
@@ -279,6 +288,7 @@ int ds4_cuda_init(ds4_cuda_info *info, char *err, size_t errlen) {
         !load_symbol((void **)&p_cuDeviceGet, "cuDeviceGet", err, errlen) ||
         !load_symbol((void **)&p_cuDeviceGetName, "cuDeviceGetName", err, errlen) ||
         !load_symbol((void **)&p_cuDeviceTotalMem, "cuDeviceTotalMem_v2", err, errlen) ||
+        !load_symbol((void **)&p_cuDeviceGetAttribute, "cuDeviceGetAttribute", err, errlen) ||
         !load_symbol((void **)&p_cuCtxCreate, "cuCtxCreate_v2", err, errlen) ||
         !load_symbol((void **)&p_cuCtxDestroy, "cuCtxDestroy_v2", err, errlen) ||
         !load_symbol((void **)&p_cuCtxSetCurrent, "cuCtxSetCurrent", err, errlen) ||
@@ -372,6 +382,11 @@ int ds4_cuda_init(ds4_cuda_info *info, char *err, size_t errlen) {
     }
     g_info.total_mem = (uint64_t)total;
 
+    /* Compute capability -> NVRTC arch default (75 = MAJOR, 76 = MINOR). */
+    g_cc_major = 0; g_cc_minor = 0;
+    (void)p_cuDeviceGetAttribute(&g_cc_major, 75, dev);
+    (void)p_cuDeviceGetAttribute(&g_cc_minor, 76, dev);
+
     rc = p_cuCtxCreate(&g_cuda_ctx, 0x08u, dev);
     if (rc != 0) {
         set_cuda_err(err, errlen, "cuCtxCreate", rc);
@@ -431,6 +446,7 @@ void ds4_cuda_cleanup(void) {
     p_cuCtxCreate = NULL;
     p_cuCtxDestroy = NULL;
     p_cuCtxSetCurrent = NULL;
+    p_cuDeviceGetAttribute = NULL;
     p_cuDeviceCanAccessPeer = NULL;
     p_cuCtxEnablePeerAccess = NULL;
     p_cuMemGetInfo = NULL;
@@ -941,7 +957,15 @@ int ds4_cuda_module_load_source(ds4_cuda_module **out, const char *source, const
         return 0;
     }
 
+    /* Default the JIT target to the actual device's compute capability so the
+     * image is valid on whatever GPU we are running (RTX 6000 Ada sm_89, H100
+     * sm_90, ...).  DS4_CUDA_ARCH overrides. */
     const char *arch = getenv("DS4_CUDA_ARCH");
+    char arch_detected[16] = "";
+    if ((!arch || !arch[0]) && g_cc_major > 0) {
+        snprintf(arch_detected, sizeof(arch_detected), "sm_%d%d", g_cc_major, g_cc_minor);
+        arch = arch_detected;
+    }
     if (!arch || !arch[0]) arch = "sm_89";
     char arch_opt[64];
     snprintf(arch_opt, sizeof(arch_opt), "--gpu-architecture=%s", arch);

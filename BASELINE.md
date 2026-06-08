@@ -394,16 +394,29 @@ verified.  Full residency is achieved but decode is **neutral (slightly worse)**
 P2P DtoD dev1→dev0 = **26.7 GB/s**, host→dev0 = **24.2 GB/s** — both PCIe-bound
 and essentially equal.  Moving experts from host RAM to peer VRAM does not change
 the read bandwidth, so there is no decode win.  The benefit requires an
-inter-GPU link faster than host PCIe: on the H100 node these two GPUs are
-**NV18 NVLink** (cuDeviceCanAccessPeer=1, ~700–900 GB/s, ~30× host PCIe), where
-moving the ~23 overflow layers off the PCIe path should be a large win.  (The
-H100 measurement was blocked by node I/O contention; the implementation is
-correct and engages there — `dev0=N, peer/dev1=M` in the promotion log.)
+inter-GPU link faster than host PCIe.
+
+**Confirmed on 2× H100 80GB (NV18 NVLink, ~30× host PCIe), same model, N=64.**
+(The NVRTC arch now auto-detects the device compute capability — Hopper needs
+sm_90; the old fixed `sm_89` default gave "invalid device kernel image (300)".
+`DS4_CUDA_ARCH` still overrides.)
+
+| config | residency | decode | prefill |
+|--------|-----------|--------|---------|
+| `dev0_full` (1 GPU, natural budget) | 39/43, 4 host-mapped | 12.29 t/s | 15.70 t/s |
+| `dev0_cap20` (1 GPU, dev0 capped 20 GiB) | 11/43, **32 host-mapped (PCIe)** | **7.34 t/s** | 8.40 t/s |
+| `peer_cap20` (2 GPU, same 11 on dev0)    | **43/43** (dev0=11, dev1=32 **NVLink**) | **13.54 t/s** | 17.91 t/s |
+
+Same dev0 budget, the 32 overflow layers moved from host-mapped PCIe to peer
+VRAM over NVLink: **7.34 → 13.54 t/s = 1.84× decode**.  Full residency via NVLink
+(13.54) even beats single-GPU partial residency (12.29).  All three outputs are
+byte-identical to each other and to the RTX run (greedy, temp 0).
 
 Conclusion: **multi-GPU expert residency is a correctness-complete capability
-whose payoff is gated by interconnect bandwidth — material on NVLink, a wash on
-PCIe-only cards.**  The earlier roadmap's "~14–16 t/s on full residency"
-prediction assumed VRAM ≫ host bandwidth, which does not hold for PCIe P2P.
+whose payoff is gated by interconnect bandwidth — a 1.84× win on NVLink (H100),
+a wash on PCIe-only cards (RTX 6000 Ada).**  The earlier roadmap's "~14–16 t/s
+on full residency" prediction holds only where VRAM ≫ host bandwidth (NVLink);
+it does not for PCIe P2P.
 
 ### Fusion + CUDA-graphs verification (settles the per-token-launch question)
 
