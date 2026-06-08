@@ -9,7 +9,7 @@
 #SBATCH --partition=bigTiger
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:rtx_6000:2
+#SBATCH --gres=gpu:rtx_6000:4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --output=logs/slurm-ds4-rtx-%j.out

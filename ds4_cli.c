@@ -48,6 +48,9 @@ typedef struct {
     char *prompt_owned;
     bool inspect;
     bool session_smoke;
+    bool cuda_parity_probe;
+    bool cuda_batch_kernel_test;
+    bool cuda_chunked_prefill_test;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -144,6 +147,9 @@ static void usage(FILE *fp) {
         "      Load the model and print a summary only.\n"
         "  --session-smoke\n"
         "      Allocate and free one backend session, then exit. Useful for Slurm CUDA smoke tests.\n"
+        "  --cuda-parity-probe\n"
+        "      Run the same prompt through the CUDA executor and the CPU reference per-token,\n"
+        "      then print the post-prefill logits delta (max-abs, RMS, top-1 / top-5). Diagnostic.\n"
         "  --dump-tokens\n"
         "      Print the encoded chat prompt tokens.\n"
         "  --dump-logprobs FILE\n"
@@ -1244,6 +1250,15 @@ static cli_config parse_options(int argc, char **argv) {
             c.inspect = true;
         } else if (!strcmp(arg, "--session-smoke")) {
             c.session_smoke = true;
+        } else if (!strcmp(arg, "--cuda-parity-probe")) {
+            c.cuda_parity_probe = true;
+            c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--cuda-batch-kernel-test")) {
+            c.cuda_batch_kernel_test = true;
+            c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--cuda-chunked-prefill-test")) {
+            c.cuda_chunked_prefill_test = true;
+            c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -1286,7 +1301,65 @@ int main(int argc, char **argv) {
             ds4_session_free(session);
         }
     }
-    if (cfg.inspect || cfg.session_smoke) {
+    if (rc == 0 && cfg.cuda_parity_probe) {
+        const char *probe_prompt = cfg.gen.prompt
+                ? cfg.gen.prompt
+                : "The quick brown fox jumps over the lazy dog.";
+        ds4_session *session = NULL;
+        if (ds4_session_create(&session, engine, cfg.gen.ctx_size) != 0) {
+            fprintf(stderr, "ds4: parity probe: session create failed\n");
+            rc = 1;
+        } else {
+            ds4_tokens tokens = {0};
+            ds4_tokenize_text(engine, probe_prompt, &tokens);
+            char err[512] = "";
+            int prc = ds4_session_cuda_parity_probe(session, &tokens, err, sizeof(err));
+            if (prc != 0 && err[0]) {
+                fprintf(stderr, "ds4: parity probe: %s\n", err);
+            }
+            rc = prc;
+            ds4_tokens_free(&tokens);
+            ds4_session_free(session);
+        }
+    }
+    if (rc == 0 && cfg.cuda_batch_kernel_test) {
+        ds4_session *session = NULL;
+        if (ds4_session_create(&session, engine, cfg.gen.ctx_size) != 0) {
+            fprintf(stderr, "ds4: batch kernel test: session create failed\n");
+            rc = 1;
+        } else {
+            char err[512] = "";
+            int trc = ds4_session_cuda_batch_kernel_test(session, err, sizeof(err));
+            if (trc != 0 && err[0]) {
+                fprintf(stderr, "ds4: batch kernel test: %s\n", err);
+            }
+            rc = trc;
+            ds4_session_free(session);
+        }
+    }
+    if (rc == 0 && cfg.cuda_chunked_prefill_test) {
+        const char *probe_prompt = cfg.gen.prompt
+                ? cfg.gen.prompt
+                : "The quick brown fox jumps over the lazy dog.";
+        ds4_session *session = NULL;
+        if (ds4_session_create(&session, engine, cfg.gen.ctx_size) != 0) {
+            fprintf(stderr, "ds4: chunked prefill test: session create failed\n");
+            rc = 1;
+        } else {
+            ds4_tokens tokens = {0};
+            ds4_tokenize_text(engine, probe_prompt, &tokens);
+            char err[512] = "";
+            int prc = ds4_session_cuda_chunked_prefill_test(session, &tokens, err, sizeof(err));
+            if (prc != 0 && err[0]) {
+                fprintf(stderr, "ds4: chunked prefill test: %s\n", err);
+            }
+            rc = prc;
+            ds4_tokens_free(&tokens);
+            ds4_session_free(session);
+        }
+    }
+    if (cfg.inspect || cfg.session_smoke || cfg.cuda_parity_probe ||
+        cfg.cuda_batch_kernel_test || cfg.cuda_chunked_prefill_test) {
         /* Diagnostics above are complete. */
     } else if (cfg.gen.prompt == NULL) {
         rc = run_repl(engine, &cfg);

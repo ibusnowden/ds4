@@ -69,6 +69,13 @@ typedef struct {
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
+
+/* Bind backend-specific per-thread state to the calling thread.  Required
+ * before a worker thread that did not call ds4_engine_open launches engine
+ * work — currently only the CUDA backend has a per-thread context.  No-op
+ * for other backends.  Returns 0 on success, nonzero with an error message
+ * on failure. */
+int ds4_engine_attach_thread(ds4_engine *e, char *err, size_t errlen);
 void ds4_engine_summary(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
@@ -129,6 +136,27 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+
+/* Drives the CUDA executor and the CPU reference per-token through the same
+ * prompt and prints the post-prefill logits delta (max-abs, RMS, top-1
+ * agreement, top-5 lists).  Diagnostic only.  Requires backend=cuda. Returns
+ * 0 when top-1 matches and max-abs < 0.5; nonzero otherwise. */
+int ds4_session_cuda_parity_probe(ds4_session *s, const ds4_tokens *prompt,
+                                  char *err, size_t errlen);
+
+/* CUDA batched-kernel self-test: drives the new (n_tokens, out_dim) batched
+ * matvec kernels and compares their output against the existing single-token
+ * matvecs run M times.  Returns 0 if outputs match bit-for-bit, nonzero with
+ * an error message otherwise. */
+int ds4_session_cuda_batch_kernel_test(ds4_session *s, char *err, size_t errlen);
+
+/* CUDA chunked-prefill parity test: runs the prompt through both the per-token
+ * cuda_graph_prefill_loop and cuda_graph_prefill_chunked_range, then compares
+ * post-prefill logits.  Pass criterion: top-1 match and max-abs < 5.0 (same
+ * gate as ds4_session_cuda_parity_probe — accounts for FP32 reduction-order
+ * differences). */
+int ds4_session_cuda_chunked_prefill_test(ds4_session *s, const ds4_tokens *prompt,
+                                          char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

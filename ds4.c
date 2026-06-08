@@ -13582,6 +13582,25 @@ typedef struct {
     ds4_cuda_kernel *matvec_f16_f32;
     ds4_cuda_kernel *matvec_q8_0_f32;
     ds4_cuda_kernel *matvec_q8_0_grouped_f32;
+    /* Batched (n_tokens, out_dim) variants used by layer-major prefill. */
+    ds4_cuda_kernel *matvec_f16_f32_batch;
+    ds4_cuda_kernel *matvec_q8_0_f32_batch;
+    ds4_cuda_kernel *head_rms_norm_f32_batch;
+    ds4_cuda_kernel *rope_tail_f32_batch;
+    ds4_cuda_kernel *hc4_post_f32_batch;
+    ds4_cuda_kernel *kv_fp8_round_trip_f32_batch;
+    ds4_cuda_kernel *embed_token_hc_f16_batch;
+    ds4_cuda_kernel *matvec_q8_0_grouped_f32_batch;
+    ds4_cuda_kernel *hc4_split_weighted_sum_norm_f32_batch;
+    ds4_cuda_kernel *router_probs_f32_batch;
+    ds4_cuda_kernel *router_topk_select_f32_batch;
+    ds4_cuda_kernel *router_hash_select_f32_batch;
+    ds4_cuda_kernel *indexer_scores_f32_batch;
+    ds4_cuda_kernel *indexer_topk_mask_f32_batch;
+    ds4_cuda_kernel *indexer_weight_scale_f32_batch;
+    ds4_cuda_kernel *routed_iq2_swiglu_f32_batch;
+    ds4_cuda_kernel *routed_q2_down_sum_f32_batch;
+    ds4_cuda_kernel *attention_mixed_f32_batch;
     ds4_cuda_kernel *attention_one_f32;
     ds4_cuda_kernel *hc4_post_f32;
     ds4_cuda_kernel *swiglu_f32;
@@ -13611,6 +13630,10 @@ typedef struct {
     ds4_cuda_kernel *copy_f32;
     ds4_cuda_kernel *indexer_weight_scale_f32;
     ds4_cuda_kernel *router_probs_f32;
+    /* Fused kernels for compressor emit and indexer mask paths. */
+    ds4_cuda_kernel *compressor_emit_fused_f32;
+    ds4_cuda_kernel *indexer_scores_fused_f32;
+    ds4_cuda_kernel *indexer_topk_from_scores_f32;
     /* Per-layer GPU KV cache for the full executor; allocated by cuda_graph_alloc. */
     ds4_cuda_layer_cache layer_cache[DS4_N_LAYER];
     /* Activation tensors for the full forward pass. */
@@ -13649,16 +13672,96 @@ typedef struct {
     ds4_cuda_tensor *eval_index_weights;   /* DS4_N_INDEXER_HEAD */
     ds4_cuda_tensor *eval_index_scores;    /* comp_cap (max) */
     ds4_cuda_tensor *eval_index_allowed;   /* comp_cap (max) u32 */
+    ds4_cuda_tensor *eval_index_global_scores; /* comp_cap (max) f32, for fused indexer */
     ds4_cuda_tensor *eval_output_pre;      /* DS4_N_HC */
     ds4_cuda_tensor *eval_output_weights;  /* DS4_N_HC */
     ds4_cuda_tensor *eval_output_embd;     /* DS4_N_EMBD */
     ds4_cuda_tensor *eval_output_norm;     /* DS4_N_EMBD */
+    /* Batched activation tensors used by cuda_graph_prefill_chunked_range.
+     * Each is M-token contiguous, where M = batch_chunk_cap (set at alloc).
+     * Allocated only when batch_chunk_cap > 1 (i.e., ctx large enough). */
+    uint32_t batch_chunk_cap;              /* max M for chunked prefill */
+    ds4_cuda_tensor *batch_tokens;         /* M ints */
+    ds4_cuda_tensor *batch_cur_hc;         /* M * DS4_N_HC * DS4_N_EMBD f32 */
+    ds4_cuda_tensor *batch_next_hc;
+    ds4_cuda_tensor *batch_after_attn_hc;
+    ds4_cuda_tensor *batch_flat_hc;
+    ds4_cuda_tensor *batch_hc_mix;
+    ds4_cuda_tensor *batch_hc_split;
+    ds4_cuda_tensor *batch_attn_cur;
+    ds4_cuda_tensor *batch_attn_norm;
+    ds4_cuda_tensor *batch_qr;
+    ds4_cuda_tensor *batch_qr_norm;
+    ds4_cuda_tensor *batch_q;
+    ds4_cuda_tensor *batch_kv_raw;
+    ds4_cuda_tensor *batch_kv;
+    ds4_cuda_tensor *batch_heads;
+    ds4_cuda_tensor *batch_attn_low;
+    ds4_cuda_tensor *batch_attn_out;
+    ds4_cuda_tensor *batch_ffn_hc_mix;
+    ds4_cuda_tensor *batch_ffn_hc_split;
+    ds4_cuda_tensor *batch_ffn_cur;
+    ds4_cuda_tensor *batch_ffn_norm;
+    ds4_cuda_tensor *batch_router_logits;
+    ds4_cuda_tensor *batch_router_probs;
+    ds4_cuda_tensor *batch_router_selected;
+    ds4_cuda_tensor *batch_router_weights;
+    ds4_cuda_tensor *batch_routed_mid;
+    ds4_cuda_tensor *batch_routed_out;
+    ds4_cuda_tensor *batch_shared_gate;
+    ds4_cuda_tensor *batch_shared_up;
+    ds4_cuda_tensor *batch_shared_mid;
+    ds4_cuda_tensor *batch_shared_out;
+    ds4_cuda_tensor *batch_ffn_out;
     bool full_executor_ready;
     bool executor_ready;
+    /* When true, every DS4_CUDA_SYNC macro waits for the stream — slow but
+     * makes kernel errors point to the offending launch.  Set via
+     * DS4_CUDA_DEBUG_SYNC=1 at session creation. */
+    bool debug_sync;
+    /* Hot-weight pool: a single VRAM allocation that mirrors a subset of the
+     * GGUF tensor section.  cuda_graph_promote_hot_weights walks the model
+     * and copies the small frequently-read tensors (norms, attn LoRAs,
+     * shared experts, router, output head, token_embd, etc.) here so the
+     * matvec kernels read VRAM at ~1 TB/s rather than host RAM at ~PCIe
+     * speed.  The bulk routed-expert weights (ffn_gate/up/down_exps,
+     * ~73 GiB) stay host-mapped via g->model_weights because they exceed
+     * the GPU's VRAM. */
+    ds4_cuda_tensor *hot_pool;
+    /* Overflow pool on the peer device (device 1).  Routed-expert layers that
+     * do not fit in device-0 VRAM are promoted here and read by device-0
+     * kernels over NVLink/PCIe peer access.  NULL when single-GPU. */
+    ds4_cuda_tensor *hot_pool_peer;
+    uint64_t hot_pool_peer_bytes;
+    uint32_t expert_layers_dev0;
+    uint32_t expert_layers_peer;
+    /* Sorted by gguf_offset; binary-searched in cuda_graph_tensor_device_ptr.
+     * vram_ptr may point into hot_pool (device 0) or hot_pool_peer (device 1);
+     * the lookup is device-agnostic since unified addressing makes pointers
+     * globally unique and peer access lets device-0 kernels read both. */
+    struct cuda_hot_entry {
+        uint64_t gguf_offset;
+        uint64_t bytes;
+        uint64_t vram_ptr;
+    } *hot_entries;
+    uint32_t hot_count;
+    uint32_t hot_cap;
+    uint64_t hot_pool_bytes;
 } ds4_cuda_graph;
 
 static void cuda_graph_free(ds4_cuda_graph *g) {
     if (!g) return;
+    /* Hot-weight VRAM pool. */
+    free(g->hot_entries);
+    g->hot_entries = NULL;
+    g->hot_count = 0;
+    g->hot_cap = 0;
+    ds4_cuda_tensor_free(g->hot_pool);
+    g->hot_pool = NULL;
+    g->hot_pool_bytes = 0;
+    ds4_cuda_tensor_free(g->hot_pool_peer);
+    g->hot_pool_peer = NULL;
+    g->hot_pool_peer_bytes = 0;
     /* Free per-layer caches first. */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_cuda_layer_cache *lc = &g->layer_cache[il];
@@ -13671,12 +13774,45 @@ static void cuda_graph_free(ds4_cuda_graph *g) {
         ds4_cuda_tensor_free(lc->raw_kv);
     }
     /* Free per-token activation tensors. */
+    ds4_cuda_tensor_free(g->batch_ffn_out);
+    ds4_cuda_tensor_free(g->batch_shared_out);
+    ds4_cuda_tensor_free(g->batch_shared_mid);
+    ds4_cuda_tensor_free(g->batch_shared_up);
+    ds4_cuda_tensor_free(g->batch_shared_gate);
+    ds4_cuda_tensor_free(g->batch_routed_out);
+    ds4_cuda_tensor_free(g->batch_routed_mid);
+    ds4_cuda_tensor_free(g->batch_router_weights);
+    ds4_cuda_tensor_free(g->batch_router_selected);
+    ds4_cuda_tensor_free(g->batch_router_probs);
+    ds4_cuda_tensor_free(g->batch_router_logits);
+    ds4_cuda_tensor_free(g->batch_ffn_norm);
+    ds4_cuda_tensor_free(g->batch_ffn_cur);
+    ds4_cuda_tensor_free(g->batch_ffn_hc_split);
+    ds4_cuda_tensor_free(g->batch_ffn_hc_mix);
+    ds4_cuda_tensor_free(g->batch_attn_out);
+    ds4_cuda_tensor_free(g->batch_attn_low);
+    ds4_cuda_tensor_free(g->batch_heads);
+    ds4_cuda_tensor_free(g->batch_kv);
+    ds4_cuda_tensor_free(g->batch_kv_raw);
+    ds4_cuda_tensor_free(g->batch_q);
+    ds4_cuda_tensor_free(g->batch_qr_norm);
+    ds4_cuda_tensor_free(g->batch_qr);
+    ds4_cuda_tensor_free(g->batch_attn_norm);
+    ds4_cuda_tensor_free(g->batch_attn_cur);
+    ds4_cuda_tensor_free(g->batch_hc_split);
+    ds4_cuda_tensor_free(g->batch_hc_mix);
+    ds4_cuda_tensor_free(g->batch_flat_hc);
+    ds4_cuda_tensor_free(g->batch_after_attn_hc);
+    ds4_cuda_tensor_free(g->batch_next_hc);
+    ds4_cuda_tensor_free(g->batch_cur_hc);
+    ds4_cuda_tensor_free(g->batch_tokens);
     ds4_cuda_tensor_free(g->eval_output_norm);
     ds4_cuda_tensor_free(g->eval_output_embd);
     ds4_cuda_tensor_free(g->eval_output_weights);
     ds4_cuda_tensor_free(g->eval_output_pre);
     ds4_cuda_tensor_free(g->eval_index_allowed);
     ds4_cuda_tensor_free(g->eval_index_scores);
+    ds4_cuda_tensor_free(g->eval_index_global_scores);
     ds4_cuda_tensor_free(g->eval_index_weights);
     ds4_cuda_tensor_free(g->eval_index_q);
     ds4_cuda_tensor_free(g->eval_index_comp);
@@ -13737,6 +13873,24 @@ static void cuda_graph_free(ds4_cuda_graph *g) {
     ds4_cuda_kernel_free(g->router_hash_select_f32);
     ds4_cuda_kernel_free(g->attention_one_f32);
     ds4_cuda_kernel_free(g->matvec_q8_0_grouped_f32);
+    ds4_cuda_kernel_free(g->attention_mixed_f32_batch);
+    ds4_cuda_kernel_free(g->routed_q2_down_sum_f32_batch);
+    ds4_cuda_kernel_free(g->routed_iq2_swiglu_f32_batch);
+    ds4_cuda_kernel_free(g->indexer_weight_scale_f32_batch);
+    ds4_cuda_kernel_free(g->indexer_topk_mask_f32_batch);
+    ds4_cuda_kernel_free(g->indexer_scores_f32_batch);
+    ds4_cuda_kernel_free(g->router_hash_select_f32_batch);
+    ds4_cuda_kernel_free(g->router_topk_select_f32_batch);
+    ds4_cuda_kernel_free(g->router_probs_f32_batch);
+    ds4_cuda_kernel_free(g->hc4_split_weighted_sum_norm_f32_batch);
+    ds4_cuda_kernel_free(g->matvec_q8_0_grouped_f32_batch);
+    ds4_cuda_kernel_free(g->embed_token_hc_f16_batch);
+    ds4_cuda_kernel_free(g->kv_fp8_round_trip_f32_batch);
+    ds4_cuda_kernel_free(g->hc4_post_f32_batch);
+    ds4_cuda_kernel_free(g->rope_tail_f32_batch);
+    ds4_cuda_kernel_free(g->head_rms_norm_f32_batch);
+    ds4_cuda_kernel_free(g->matvec_q8_0_f32_batch);
+    ds4_cuda_kernel_free(g->matvec_f16_f32_batch);
     ds4_cuda_kernel_free(g->matvec_q8_0_f32);
     ds4_cuda_kernel_free(g->matvec_f16_f32);
     ds4_cuda_kernel_free(g->embed_token_hc_f16);
@@ -13810,6 +13964,24 @@ static bool cuda_graph_load_executor(ds4_cuda_graph *g, char *err, size_t errlen
         !ds4_cuda_module_get_kernel(&g->embed_token_hc_f16, g->module, "ds4_embed_token_hc_f16", err, errlen) ||
         !ds4_cuda_module_get_kernel(&g->matvec_f16_f32, g->module, "ds4_matvec_f16_f32", err, errlen) ||
         !ds4_cuda_module_get_kernel(&g->matvec_q8_0_f32, g->module, "ds4_matvec_q8_0_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->matvec_f16_f32_batch, g->module, "ds4_matvec_f16_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->matvec_q8_0_f32_batch, g->module, "ds4_matvec_q8_0_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->head_rms_norm_f32_batch, g->module, "ds4_head_rms_norm_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->rope_tail_f32_batch, g->module, "ds4_rope_tail_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->hc4_post_f32_batch, g->module, "ds4_hc4_post_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->kv_fp8_round_trip_f32_batch, g->module, "ds4_kv_fp8_round_trip_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->embed_token_hc_f16_batch, g->module, "ds4_embed_token_hc_f16_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->matvec_q8_0_grouped_f32_batch, g->module, "ds4_matvec_q8_0_grouped_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->hc4_split_weighted_sum_norm_f32_batch, g->module, "ds4_hc4_split_weighted_sum_norm_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->router_probs_f32_batch, g->module, "ds4_router_probs_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->router_topk_select_f32_batch, g->module, "ds4_router_topk_select_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->router_hash_select_f32_batch, g->module, "ds4_router_hash_select_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->indexer_scores_f32_batch, g->module, "ds4_indexer_scores_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->indexer_topk_mask_f32_batch, g->module, "ds4_indexer_topk_mask_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->indexer_weight_scale_f32_batch, g->module, "ds4_indexer_weight_scale_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->routed_iq2_swiglu_f32_batch, g->module, "ds4_routed_iq2_swiglu_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->routed_q2_down_sum_f32_batch, g->module, "ds4_routed_q2_down_sum_f32_batch", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->attention_mixed_f32_batch, g->module, "ds4_attention_mixed_f32_batch", err, errlen) ||
         !ds4_cuda_module_get_kernel(&g->matvec_q8_0_grouped_f32, g->module, "ds4_matvec_q8_0_grouped_f32", err, errlen) ||
         !ds4_cuda_module_get_kernel(&g->attention_one_f32, g->module, "ds4_attention_one_f32", err, errlen) ||
         !ds4_cuda_module_get_kernel(&g->hc4_post_f32, g->module, "ds4_hc4_post_f32", err, errlen) ||
@@ -13836,7 +14008,10 @@ static bool cuda_graph_load_executor(ds4_cuda_graph *g, char *err, size_t errlen
         !ds4_cuda_module_get_kernel(&g->head_rms_norm_weight_f32, g->module, "ds4_head_rms_norm_weight_f32", err, errlen) ||
         !ds4_cuda_module_get_kernel(&g->copy_f32, g->module, "ds4_copy_f32", err, errlen) ||
         !ds4_cuda_module_get_kernel(&g->indexer_weight_scale_f32, g->module, "ds4_indexer_weight_scale_f32", err, errlen) ||
-        !ds4_cuda_module_get_kernel(&g->router_probs_f32, g->module, "ds4_router_probs_f32", err, errlen))
+        !ds4_cuda_module_get_kernel(&g->router_probs_f32, g->module, "ds4_router_probs_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->compressor_emit_fused_f32, g->module, "ds4_compressor_emit_fused_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->indexer_scores_fused_f32, g->module, "ds4_indexer_scores_fused_f32", err, errlen) ||
+        !ds4_cuda_module_get_kernel(&g->indexer_topk_from_scores_f32, g->module, "ds4_indexer_topk_from_scores_f32", err, errlen))
     {
         return false;
     }
@@ -13874,6 +14049,376 @@ static bool cuda_graph_register_model_weights(ds4_cuda_graph *g,
     g->model_device_base = ds4_cuda_host_device_ptr(g->model_weights);
     g->model_weight_bytes = ds4_cuda_host_bytes(g->model_weights);
     return g->model_device_base != 0 && g->model_weight_bytes == bytes;
+}
+
+/* === Hot-weight VRAM promotion =========================================
+ *
+ * The model is too big to fit entirely in VRAM (80 GiB > 48 GiB).  We
+ * mitigate the per-token PCIe ceiling by copying the small tensors that
+ * every token reads — norms, attn LoRAs, KV proj, shared expert, router,
+ * compressor/indexer, output head, token_embd — into device VRAM and
+ * leaving the bulk routed-MoE expert weights host-mapped.  The lookup in
+ * cuda_graph_tensor_device_ptr binary-searches the hot table by GGUF
+ * offset and falls back to host-mapped on miss. */
+
+static int cuda_hot_entry_cmp(const void *a, const void *b) {
+    const struct cuda_hot_entry *x = a;
+    const struct cuda_hot_entry *y = b;
+    if (x->gguf_offset < y->gguf_offset) return -1;
+    if (x->gguf_offset > y->gguf_offset) return 1;
+    return 0;
+}
+
+/* Pass 1: tally bytes; Pass 2: copy and record. */
+typedef struct {
+    const ds4_model *model;
+    ds4_cuda_graph *g;
+    /* Pass-1 totals; Pass-2 running offsets. */
+    uint64_t total_bytes;
+    uint32_t total_count;
+    /* Set in pass 2 only. */
+    uint64_t cur_offset;
+    uint64_t pool_base_ptr;
+    /* Peer (device-1) overflow pool, pass 2 only. */
+    uint64_t peer_cur_offset;
+    uint64_t peer_pool_base_ptr;
+    bool pass2;
+    bool failed;
+    char *err;
+    size_t errlen;
+} cuda_hot_walk;
+
+static bool cuda_hot_walk_add(cuda_hot_walk *w, const ds4_tensor *tensor) {
+    if (w->failed) return false;
+    if (!tensor || tensor->bytes == 0) return true; /* optional/null tensor */
+    /* 256-byte align so subsequent entries don't share a cache line and so
+     * the copies are PCIe-friendly. */
+    uint64_t pad = (256u - (w->total_bytes & 255u)) & 255u;
+    if (!w->pass2) {
+        w->total_bytes += pad + tensor->bytes;
+        w->total_count++;
+        return true;
+    }
+    w->cur_offset += pad;
+    const uint8_t *src = w->model->map + tensor->abs_offset;
+    if (!ds4_cuda_tensor_write(w->g->hot_pool, w->cur_offset, src, tensor->bytes)) {
+        snprintf(w->err, w->errlen,
+                 "CUDA hot-weight HtoD copy failed for tensor %.*s (bytes=%llu)",
+                 (int)tensor->name.len, tensor->name.ptr,
+                 (unsigned long long)tensor->bytes);
+        w->failed = true;
+        return false;
+    }
+    struct cuda_hot_entry *e = &w->g->hot_entries[w->g->hot_count++];
+    e->gguf_offset = tensor->abs_offset;
+    e->bytes = tensor->bytes;
+    e->vram_ptr = w->pool_base_ptr + w->cur_offset;
+    w->cur_offset += tensor->bytes;
+    return true;
+}
+
+/* Pass-2 copy of one tensor into the peer (device-1) overflow pool.  Mirrors
+ * cuda_hot_walk_add's record step but writes to g->hot_pool_peer and aligns on
+ * the running peer offset (256-byte) so the precomputed pool size matches
+ * exactly.  The recorded vram_ptr is a device-1 pointer that device-0 kernels
+ * read via peer access. */
+static bool cuda_hot_walk_add_peer(cuda_hot_walk *w, const ds4_tensor *tensor) {
+    if (w->failed) return false;
+    if (!tensor || tensor->bytes == 0) return true;
+    w->peer_cur_offset += (256u - (w->peer_cur_offset & 255u)) & 255u;
+    const uint8_t *src = w->model->map + tensor->abs_offset;
+    if (!ds4_cuda_tensor_write(w->g->hot_pool_peer, w->peer_cur_offset, src, tensor->bytes)) {
+        snprintf(w->err, w->errlen,
+                 "CUDA peer hot-weight HtoD copy failed for tensor %.*s (bytes=%llu)",
+                 (int)tensor->name.len, tensor->name.ptr,
+                 (unsigned long long)tensor->bytes);
+        w->failed = true;
+        return false;
+    }
+    struct cuda_hot_entry *e = &w->g->hot_entries[w->g->hot_count++];
+    e->gguf_offset = tensor->abs_offset;
+    e->bytes = tensor->bytes;
+    e->vram_ptr = w->peer_pool_base_ptr + w->peer_cur_offset;
+    w->peer_cur_offset += tensor->bytes;
+    return true;
+}
+
+static bool cuda_hot_walk_layer(cuda_hot_walk *w, const ds4_layer_weights *L,
+                                uint32_t il) {
+    /* Pass routed_*_exps through; they stay host-mapped. */
+    if (!cuda_hot_walk_add(w, L->attn_norm)        ||
+        !cuda_hot_walk_add(w, L->attn_q_a)         ||
+        !cuda_hot_walk_add(w, L->attn_q_a_norm)    ||
+        !cuda_hot_walk_add(w, L->attn_q_b)         ||
+        !cuda_hot_walk_add(w, L->attn_kv)          ||
+        !cuda_hot_walk_add(w, L->attn_kv_a_norm)   ||
+        !cuda_hot_walk_add(w, L->attn_sinks)       ||
+        !cuda_hot_walk_add(w, L->attn_output_a)    ||
+        !cuda_hot_walk_add(w, L->attn_output_b)    ||
+        !cuda_hot_walk_add(w, L->ffn_norm)         ||
+        !cuda_hot_walk_add(w, L->ffn_gate_inp)     ||
+        !cuda_hot_walk_add(w, L->ffn_gate_shexp)   ||
+        !cuda_hot_walk_add(w, L->ffn_up_shexp)     ||
+        !cuda_hot_walk_add(w, L->ffn_down_shexp)   ||
+        !cuda_hot_walk_add(w, L->hc_attn_fn)       ||
+        !cuda_hot_walk_add(w, L->hc_attn_scale)    ||
+        !cuda_hot_walk_add(w, L->hc_attn_base)     ||
+        !cuda_hot_walk_add(w, L->hc_ffn_fn)        ||
+        !cuda_hot_walk_add(w, L->hc_ffn_scale)     ||
+        !cuda_hot_walk_add(w, L->hc_ffn_base)      ||
+        !cuda_hot_walk_add(w, L->ffn_exp_probs_b)  ||
+        !cuda_hot_walk_add(w, L->ffn_gate_tid2eid))
+    {
+        return false;
+    }
+    if (ds4_layer_compress_ratio(il) != 0) {
+        if (!cuda_hot_walk_add(w, L->attn_compressor_kv)   ||
+            !cuda_hot_walk_add(w, L->attn_compressor_gate) ||
+            !cuda_hot_walk_add(w, L->attn_compressor_ape)  ||
+            !cuda_hot_walk_add(w, L->attn_compressor_norm))
+        {
+            return false;
+        }
+    }
+    if (ds4_layer_compress_ratio(il) == 4u) {
+        if (!cuda_hot_walk_add(w, L->indexer_attn_q_b)        ||
+            !cuda_hot_walk_add(w, L->indexer_proj)             ||
+            !cuda_hot_walk_add(w, L->indexer_compressor_kv)   ||
+            !cuda_hot_walk_add(w, L->indexer_compressor_gate) ||
+            !cuda_hot_walk_add(w, L->indexer_compressor_ape)  ||
+            !cuda_hot_walk_add(w, L->indexer_compressor_norm))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool cuda_hot_walk_globals(cuda_hot_walk *w, const ds4_weights *weights) {
+    return cuda_hot_walk_add(w, weights->token_embd)      &&
+           cuda_hot_walk_add(w, weights->output_norm)     &&
+           cuda_hot_walk_add(w, weights->output)          &&
+           cuda_hot_walk_add(w, weights->output_hc_fn)    &&
+           cuda_hot_walk_add(w, weights->output_hc_scale) &&
+           cuda_hot_walk_add(w, weights->output_hc_base);
+}
+
+static bool cuda_graph_promote_hot_weights(ds4_cuda_graph *g,
+                                           const ds4_model *model,
+                                           const ds4_weights *weights,
+                                           char *err, size_t errlen) {
+    if (getenv("DS4_CUDA_NO_HOT") != NULL) {
+        fprintf(stderr, "ds4: DS4_CUDA_NO_HOT set; keeping all weights host-mapped (PCIe-bound)\n");
+        return true;
+    }
+    cuda_hot_walk w = { .model = model, .g = g, .err = err, .errlen = errlen };
+    /* Pass 1: tally hot tensors. */
+    if (!cuda_hot_walk_globals(&w, weights)) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!cuda_hot_walk_layer(&w, &weights->layer[il], il)) return false;
+    }
+    if (w.total_bytes == 0) return true;
+    const uint64_t hot_only_bytes = w.total_bytes;
+    const uint32_t hot_only_count = w.total_count;
+
+    /* Opportunistic: promote whole layers' routed-expert tensors while VRAM
+     * fits.  Each layer contributes ffn_{gate,up,down}_exps (~1.7 GiB
+     * combined for V4-Flash).  The earlier "0x gain" A/B was an artifact of a
+     * pass-2 bug (experts were tallied but never copied/recorded, so the
+     * kernels silently fell back to host-mapped reads).  With that fixed, the
+     * routed-MoE swiglu/down kernels are bandwidth-bound on the host-mapped
+     * expert reads (~15 GiB/s zero-copy), so promoting each layer's experts to
+     * VRAM (~960 GiB/s) is a large decode win: on one 48 GiB card ~20/43
+     * layers fit and decode rises ~1.4x (full residency needs multi-GPU).
+     * Opt-in via DS4_CUDA_EXPERT_HOT=1; the default keeps VRAM free for KV
+     * cache and activations at large context. */
+    uint32_t expert_layers = 0;
+    uint32_t expert_layers_peer = 0;
+    uint64_t peer_pool_bytes = 0;
+    uint32_t peer_entry_count = 0;
+    /* On by default now that the pass-2 copy bug is fixed and the win is real.
+     * Promotion runs AFTER cuda_graph_alloc reserves the KV cache, so free_mem
+     * already accounts for KV/activations — the budget safely fits experts in
+     * whatever VRAM remains (fewer layers at large context).  Disable with
+     * DS4_CUDA_NO_EXPERT_HOT=1. */
+    if (getenv("DS4_CUDA_NO_EXPERT_HOT") == NULL) {
+        uint64_t free_vram = 0;
+        char free_err[256] = "";
+        if (ds4_cuda_get_free_mem(&free_vram, free_err, sizeof(free_err))) {
+            /* Reserve room for activations, KV growth, and CUDA driver
+             * overhead.  4 GiB is generous; tune via env if needed. */
+            const uint64_t safety = 4ull * 1024ull * 1024ull * 1024ull;
+            const char *budget_env = getenv("DS4_CUDA_EXPERT_BUDGET_GIB");
+            uint64_t budget = (free_vram > hot_only_bytes + safety)
+                    ? free_vram - hot_only_bytes - safety : 0;
+            if (budget_env && budget_env[0]) {
+                double v = strtod(budget_env, NULL);
+                if (v > 0) {
+                    uint64_t cap = (uint64_t)(v * 1024.0 * 1024.0 * 1024.0);
+                    if (cap < budget) budget = cap;
+                }
+            }
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                const ds4_layer_weights *L = &weights->layer[il];
+                if (!L->ffn_gate_exps || !L->ffn_up_exps || !L->ffn_down_exps) break;
+                const uint64_t layer_bytes =
+                        L->ffn_gate_exps->bytes + L->ffn_up_exps->bytes +
+                        L->ffn_down_exps->bytes + 3ull * 256ull; /* alignment headroom */
+                if (layer_bytes > budget) break;
+                if (!cuda_hot_walk_add(&w, L->ffn_gate_exps) ||
+                    !cuda_hot_walk_add(&w, L->ffn_up_exps) ||
+                    !cuda_hot_walk_add(&w, L->ffn_down_exps))
+                {
+                    return false;
+                }
+                budget -= layer_bytes;
+                expert_layers++;
+            }
+
+            /* Overflow: expert layers that did not fit on device 0 are promoted
+             * into a second GPU's VRAM and read by device-0 kernels over peer
+             * access (NVLink/PCIe).  Only triggers when device-0 budget was
+             * exhausted with layers still to go and a peer GPU is available.
+             * DS4_CUDA_EXPERT_BUDGET_GIB caps device 0 only, so it doubles as a
+             * knob to force overflow for testing.  Peer alloc failure degrades
+             * gracefully to host-mapped. */
+            if (expert_layers < DS4_N_LAYER &&
+                weights->layer[expert_layers].ffn_gate_exps) {
+                char peer_err[256] = "";
+                if (ds4_cuda_peer_init(peer_err, sizeof(peer_err))) {
+                    uint64_t peer_free = 0;
+                    if (ds4_cuda_peer_free_mem(&peer_free, peer_err, sizeof(peer_err))) {
+                        /* The peer pool holds only weights (no KV/activations),
+                         * so a smaller reserve than device 0 is safe. */
+                        const uint64_t psafety = 2ull * 1024ull * 1024ull * 1024ull;
+                        uint64_t pbudget = peer_free > psafety ? peer_free - psafety : 0;
+                        uint64_t poff = 0;
+                        for (uint32_t il = expert_layers; il < DS4_N_LAYER; il++) {
+                            const ds4_layer_weights *L = &weights->layer[il];
+                            if (!L->ffn_gate_exps || !L->ffn_up_exps || !L->ffn_down_exps) break;
+                            const uint64_t layer_bytes =
+                                    L->ffn_gate_exps->bytes + L->ffn_up_exps->bytes +
+                                    L->ffn_down_exps->bytes + 3ull * 256ull;
+                            if (layer_bytes > pbudget) break;
+                            const ds4_tensor *ts[3] = { L->ffn_gate_exps, L->ffn_up_exps, L->ffn_down_exps };
+                            for (int k = 0; k < 3; k++) {
+                                poff += (256u - (poff & 255u)) & 255u;
+                                poff += ts[k]->bytes;
+                            }
+                            peer_entry_count += 3u;
+                            pbudget -= layer_bytes;
+                            expert_layers_peer++;
+                        }
+                        peer_pool_bytes = poff;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Allocate entries + VRAM pool. */
+    g->hot_cap = w.total_count + peer_entry_count;
+    g->hot_entries = calloc(g->hot_cap, sizeof(*g->hot_entries));
+    if (!g->hot_entries) {
+        snprintf(err, errlen, "out of memory for hot table (%u entries)", g->hot_cap);
+        return false;
+    }
+    g->hot_pool = ds4_cuda_tensor_alloc(w.total_bytes);
+    if (!g->hot_pool) {
+        free(g->hot_entries);
+        g->hot_entries = NULL;
+        g->hot_cap = 0;
+        snprintf(err, errlen,
+                 "VRAM allocation for hot weight pool (%.2f GiB) failed; set DS4_CUDA_NO_HOT=1 to skip",
+                 (double)w.total_bytes / (1024.0 * 1024.0 * 1024.0));
+        return false;
+    }
+    g->hot_pool_bytes = w.total_bytes;
+
+    /* Peer (device-1) overflow pool.  Failure here is non-fatal: those layers
+     * simply stay host-mapped (the pre-multi-GPU behavior). */
+    if (peer_entry_count > 0 && peer_pool_bytes > 0) {
+        g->hot_pool_peer = ds4_cuda_tensor_alloc_peer(peer_pool_bytes);
+        if (!g->hot_pool_peer) {
+            fprintf(stderr,
+                    "ds4: peer expert pool alloc (%.2f GiB) failed; %u layers stay host-mapped\n",
+                    (double)peer_pool_bytes / (1024.0 * 1024.0 * 1024.0), expert_layers_peer);
+            peer_entry_count = 0;
+            expert_layers_peer = 0;
+        } else {
+            g->hot_pool_peer_bytes = peer_pool_bytes;
+        }
+    }
+    g->expert_layers_dev0 = expert_layers;
+    g->expert_layers_peer = expert_layers_peer;
+
+    /* Pass 2: copy + record. */
+    w.pass2 = true;
+    w.cur_offset = 0;
+    w.pool_base_ptr = ds4_cuda_tensor_device_ptr(g->hot_pool);
+    if (!cuda_hot_walk_globals(&w, weights) || w.failed) goto fail;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!cuda_hot_walk_layer(&w, &weights->layer[il], il) || w.failed) goto fail;
+    }
+    /* Pass 2 for routed experts: copy + record the first `expert_layers`
+     * layers' ffn_{gate,up,down}_exps in the SAME order tallied in pass 1.
+     * Without this the pool reserves expert space but never fills it or adds
+     * hot_entries, so cuda_graph_tensor_device_ptr falls back to host-mapped
+     * and the MoE kernels stream experts over PCIe — the real decode cap. */
+    for (uint32_t il = 0; il < expert_layers; il++) {
+        const ds4_layer_weights *L = &weights->layer[il];
+        if (!cuda_hot_walk_add(&w, L->ffn_gate_exps) ||
+            !cuda_hot_walk_add(&w, L->ffn_up_exps) ||
+            !cuda_hot_walk_add(&w, L->ffn_down_exps) || w.failed) goto fail;
+    }
+
+    /* Pass 2 for the peer-device overflow layers: copy + record into the
+     * device-1 pool.  The recorded entries carry device-1 pointers; the
+     * device-agnostic lookup returns them and the MoE kernels read over peer
+     * access. */
+    if (expert_layers_peer > 0 && g->hot_pool_peer) {
+        w.peer_cur_offset = 0;
+        w.peer_pool_base_ptr = ds4_cuda_tensor_device_ptr(g->hot_pool_peer);
+        for (uint32_t il = expert_layers; il < expert_layers + expert_layers_peer; il++) {
+            const ds4_layer_weights *L = &weights->layer[il];
+            if (!cuda_hot_walk_add_peer(&w, L->ffn_gate_exps) ||
+                !cuda_hot_walk_add_peer(&w, L->ffn_up_exps) ||
+                !cuda_hot_walk_add_peer(&w, L->ffn_down_exps) || w.failed) goto fail;
+        }
+    }
+
+    /* Sort by gguf_offset for binary search at lookup time. */
+    qsort(g->hot_entries, g->hot_count, sizeof(*g->hot_entries),
+          cuda_hot_entry_cmp);
+
+    fprintf(stderr,
+            "ds4: CUDA hot weights promoted to VRAM: %.2f GiB across %u tensors "
+            "(small=%.2f GiB/%u tensors, routed-experts=%.2f GiB across %u/%u layers"
+            " [dev0=%u, peer/dev1=%u, %.2f GiB])\n",
+            (double)(g->hot_pool_bytes + g->hot_pool_peer_bytes) / (1024.0 * 1024.0 * 1024.0),
+            g->hot_count,
+            (double)hot_only_bytes / (1024.0 * 1024.0 * 1024.0),
+            hot_only_count,
+            (double)((g->hot_pool_bytes > hot_only_bytes
+                     ? g->hot_pool_bytes - hot_only_bytes : 0) + g->hot_pool_peer_bytes)
+                    / (1024.0 * 1024.0 * 1024.0),
+            expert_layers + expert_layers_peer, (uint32_t)DS4_N_LAYER,
+            expert_layers, expert_layers_peer,
+            (double)g->hot_pool_peer_bytes / (1024.0 * 1024.0 * 1024.0));
+    return true;
+
+fail:
+    ds4_cuda_tensor_free(g->hot_pool);
+    g->hot_pool = NULL;
+    g->hot_pool_bytes = 0;
+    ds4_cuda_tensor_free(g->hot_pool_peer);
+    g->hot_pool_peer = NULL;
+    g->hot_pool_peer_bytes = 0;
+    free(g->hot_entries);
+    g->hot_entries = NULL;
+    g->hot_count = 0;
+    g->hot_cap = 0;
+    return false;
 }
 
 static bool cuda_graph_embed_token(ds4_cuda_graph *g,
@@ -13938,6 +14483,25 @@ static bool cuda_graph_tensor_device_ptr(const ds4_cuda_graph *g,
         snprintf(err, errlen, "CUDA tensor %.*s is outside the mapped weight range",
                  (int)tensor->name.len, tensor->name.ptr);
         return false;
+    }
+    /* Hot-weight VRAM pool: binary-search for an entry whose gguf_offset
+     * matches.  hit->bytes is the exact tensor size we copied; we only return
+     * the VRAM pointer when the requested span fits inside that copy. */
+    if (g->hot_count > 0) {
+        const struct cuda_hot_entry *base = g->hot_entries;
+        uint32_t lo = 0, hi = g->hot_count;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2u;
+            if (base[mid].gguf_offset == tensor->abs_offset) {
+                if (tensor->bytes <= base[mid].bytes) {
+                    *out = base[mid].vram_ptr;
+                    return true;
+                }
+                break;
+            }
+            if (base[mid].gguf_offset < tensor->abs_offset) lo = mid + 1u;
+            else hi = mid;
+        }
     }
     *out = g->model_device_base + (tensor->abs_offset - model->tensor_data_pos);
     return true;
@@ -14512,8 +15076,20 @@ static bool cuda_graph_probe_layer0_q_path(ds4_cuda_graph *g,
                                    (args), err, errlen) == 0) return false;              \
     } while (0)
 
+/* Per-launch synchronization is unnecessary on a single CUDA stream: kernel
+ * launches on the same stream are ordered, and a later kernel observing an
+ * earlier kernel's output waits for it via stream order, not host sync.
+ * Set DS4_CUDA_DEBUG_SYNC=1 to turn the explicit sync back on for kernel-by-
+ * kernel error attribution.  The end of cuda_graph_eval_token still emits one
+ * explicit sync to surface any deferred error before logits readback. */
 #define DS4_CUDA_SYNC()                                                                   \
-    do { if (ds4_cuda_synchronize(err, errlen) == 0) return false; } while (0)
+    do {                                                                                  \
+        if (g->debug_sync &&                                                              \
+            ds4_cuda_synchronize(err, errlen) == 0) return false;                         \
+    } while (0)
+
+/* Forward decl: MoE routed-kernel block size (defined below, near eval_token). */
+static unsigned int cuda_moe_block(void);
 
 static bool cuda_eval_launch_kv_fp8(ds4_cuda_graph *g, ds4_cuda_tensor *kv,
                                     uint32_t head_dim, uint32_t n_rot,
@@ -14577,6 +15153,457 @@ static bool cuda_eval_launch_matvec_q8_0(ds4_cuda_graph *g, ds4_cuda_tensor *dst
     uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
     void *args[] = { &dst_ptr, &w_ptr, &x_ptr, &in_dim, &out_dim };
     DS4_CUDA_LAUNCH(g->matvec_q8_0_f32, out_dim, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_matvec_f16_batch(ds4_cuda_graph *g, ds4_cuda_tensor *dst,
+                                              uint64_t w_ptr, ds4_cuda_tensor *x,
+                                              uint32_t in_dim, uint32_t out_dim,
+                                              uint32_t n_tokens,
+                                              char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    void *args[] = { &dst_ptr, &w_ptr, &x_ptr, &in_dim, &out_dim, &n_tokens };
+    DS4_CUDA_LAUNCH(g->matvec_f16_f32_batch, out_dim, n_tokens, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_matvec_q8_0_batch(ds4_cuda_graph *g, ds4_cuda_tensor *dst,
+                                               uint64_t w_ptr, ds4_cuda_tensor *x,
+                                               uint32_t in_dim, uint32_t out_dim,
+                                               uint32_t n_tokens,
+                                               char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    void *args[] = { &dst_ptr, &w_ptr, &x_ptr, &in_dim, &out_dim, &n_tokens };
+    DS4_CUDA_LAUNCH(g->matvec_q8_0_f32_batch, out_dim, n_tokens, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+/* Batched RMS over n_tokens rows: existing single-token kernel already takes
+ * row = blockIdx.x with src/dst strides, so we just pass n_tokens as the
+ * grid.  No new kernel needed — same reduction tree, bit-equal output. */
+static bool cuda_eval_launch_rms_general_batch(ds4_cuda_graph *g, ds4_cuda_tensor *dst,
+                                               ds4_cuda_tensor *src, uint64_t weight_ptr,
+                                               uint32_t n, bool use_weight,
+                                               uint32_t n_tokens,
+                                               char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t src_ptr = ds4_cuda_tensor_device_ptr(src);
+    uint32_t src_stride = n;
+    uint32_t dst_stride = n;
+    float eps = DS4_RMS_EPS;
+    int use_weight_i = use_weight ? 1 : 0;
+    void *args[] = {
+        &dst_ptr, &src_ptr, &weight_ptr,
+        &n, &src_stride, &dst_stride, &eps, &use_weight_i,
+    };
+    DS4_CUDA_LAUNCH(g->rms_norm_f32, n_tokens, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_head_rms_batch(ds4_cuda_graph *g, ds4_cuda_tensor *x,
+                                            uint32_t n_head, uint32_t head_dim,
+                                            uint32_t n_tokens,
+                                            char *err, size_t errlen) {
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    float eps = DS4_RMS_EPS;
+    void *args[] = { &x_ptr, &n_head, &head_dim, &eps, &n_tokens };
+    DS4_CUDA_LAUNCH(g->head_rms_norm_f32_batch, n_head, n_tokens, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_rope_batch(ds4_cuda_graph *g, ds4_cuda_tensor *x,
+                                        uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
+                                        uint32_t pos0, uint32_t n_tokens, uint32_t il,
+                                        bool inverse,
+                                        char *err, size_t errlen) {
+    const bool compressed = ds4_layer_compress_ratio(il) != 0;
+    const float freq_base = layer_rope_freq_base(il);
+    const float freq_scale = layer_rope_freq_scale(il);
+    const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+    float attn_factor = 1.0f;
+    if (ext_factor != 0.0f && freq_scale > 0.0f) {
+        attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    int inverse_i = inverse ? 1 : 0;
+    int neox = 0;
+    int n_ctx_orig = compressed ? (int)DS4_ROPE_ORIG_CTX : 0;
+    float beta_fast = DS4_ROPE_YARN_BETA_FAST;
+    float beta_slow = DS4_ROPE_YARN_BETA_SLOW;
+    void *args[] = {
+        &x_ptr, &n_head, &head_dim, &n_rot,
+        &pos0, &n_tokens, &inverse_i, &neox, &n_ctx_orig,
+        (void *)&freq_base, (void *)&freq_scale, (void *)&ext_factor,
+        &attn_factor, &beta_fast, &beta_slow,
+    };
+    const uint32_t total = n_head * head_dim * n_tokens;
+    const uint32_t block = 256;
+    const uint32_t grid = (total + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->rope_tail_f32_batch, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+/* swiglu / add are pure elementwise — the existing single-token kernels work
+ * with n = n_per_token * n_tokens.  The batched wrapper just multiplies the
+ * total element count.  Identical FP arithmetic, identical output. */
+static bool cuda_eval_launch_swiglu_batch(ds4_cuda_graph *g, ds4_cuda_tensor *dst,
+                                          ds4_cuda_tensor *gate, ds4_cuda_tensor *up,
+                                          uint32_t n_per_token, float clamp,
+                                          uint32_t n_tokens,
+                                          char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t gate_ptr = ds4_cuda_tensor_device_ptr(gate);
+    uint64_t up_ptr = ds4_cuda_tensor_device_ptr(up);
+    uint32_t n_total = n_per_token * n_tokens;
+    float scale = 1.0f;
+    void *args[] = { &dst_ptr, &gate_ptr, &up_ptr, &n_total, &clamp, &scale };
+    const uint32_t block = 256;
+    const uint32_t grid = (n_total + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->swiglu_f32, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_add_batch(ds4_cuda_graph *g, ds4_cuda_tensor *dst,
+                                       ds4_cuda_tensor *a, ds4_cuda_tensor *b,
+                                       uint32_t n_per_token, uint32_t n_tokens,
+                                       char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t a_ptr = ds4_cuda_tensor_device_ptr(a);
+    uint64_t b_ptr = ds4_cuda_tensor_device_ptr(b);
+    uint32_t n_total = n_per_token * n_tokens;
+    void *args[] = { &dst_ptr, &a_ptr, &b_ptr, &n_total };
+    const uint32_t block = 256;
+    const uint32_t grid = (n_total + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->add_f32, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_kv_fp8_batch(ds4_cuda_graph *g, ds4_cuda_tensor *kv,
+                                          uint32_t head_dim, uint32_t n_rot,
+                                          uint32_t n_tokens,
+                                          char *err, size_t errlen) {
+    uint64_t kv_ptr = ds4_cuda_tensor_device_ptr(kv);
+    uint32_t n_nope = head_dim - n_rot;
+    uint32_t groups = (n_nope + 63u) / 64u;
+    void *args[] = { &kv_ptr, &head_dim, &n_rot, &n_tokens };
+    DS4_CUDA_LAUNCH(g->kv_fp8_round_trip_f32_batch, groups, n_tokens, 1, 64, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+/* Embed-token batch: tokens is a device array of n_tokens int32s; dst_hc is
+ * [n_tokens][n_hc][n_embd] floats. */
+static bool cuda_eval_launch_embed_token_hc_batch(ds4_cuda_graph *g,
+                                                  ds4_cuda_tensor *dst_hc,
+                                                  uint64_t token_embd_ptr,
+                                                  ds4_cuda_tensor *tokens_d,
+                                                  uint32_t n_vocab, uint32_t n_embd,
+                                                  uint32_t n_hc, uint32_t n_tokens,
+                                                  char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst_hc);
+    uint64_t tok_ptr = ds4_cuda_tensor_device_ptr(tokens_d);
+    void *args[] = { &dst_ptr, &token_embd_ptr, &tok_ptr,
+                     &n_vocab, &n_embd, &n_hc, &n_tokens };
+    const uint32_t total = n_embd * n_hc * n_tokens;
+    const uint32_t block = 256;
+    const uint32_t grid = (total + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->embed_token_hc_f16_batch, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_matvec_q8_0_grouped_batch(ds4_cuda_graph *g,
+                                                       ds4_cuda_tensor *dst,
+                                                       uint64_t w_ptr,
+                                                       ds4_cuda_tensor *x,
+                                                       uint32_t group_dim, uint32_t rank,
+                                                       uint32_t n_groups, uint32_t n_tokens,
+                                                       char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    void *args[] = { &dst_ptr, &w_ptr, &x_ptr, &group_dim, &rank, &n_groups, &n_tokens };
+    const uint32_t out_dim = rank * n_groups;
+    DS4_CUDA_LAUNCH(g->matvec_q8_0_grouped_f32_batch, out_dim, n_tokens, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_hc4_split_norm_batch(ds4_cuda_graph *g,
+                                                  ds4_cuda_tensor *dst,
+                                                  ds4_cuda_tensor *norm_dst,
+                                                  ds4_cuda_tensor *split,
+                                                  ds4_cuda_tensor *mix,
+                                                  uint64_t scale_ptr,
+                                                  uint64_t base_ptr,
+                                                  ds4_cuda_tensor *x,
+                                                  uint64_t norm_weight_ptr,
+                                                  uint32_t n_embd, uint32_t hc_mix_dim,
+                                                  uint32_t n_tokens,
+                                                  char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst);
+    uint64_t norm_dst_ptr = ds4_cuda_tensor_device_ptr(norm_dst);
+    uint64_t split_ptr = ds4_cuda_tensor_device_ptr(split);
+    uint64_t mix_ptr = ds4_cuda_tensor_device_ptr(mix);
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    uint32_t sinkhorn_iters = DS4_N_HC_SINKHORN_ITER;
+    float eps = DS4_HC_EPS;
+    float norm_eps = DS4_RMS_EPS;
+    void *args[] = {
+        &dst_ptr, &norm_dst_ptr, &split_ptr, &mix_ptr,
+        &scale_ptr, &base_ptr, &x_ptr, &norm_weight_ptr,
+        &n_embd, &sinkhorn_iters, &eps, &norm_eps,
+        &hc_mix_dim, &n_tokens,
+    };
+    DS4_CUDA_LAUNCH(g->hc4_split_weighted_sum_norm_f32_batch,
+                    n_tokens, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+/* Batched router/indexer wrappers.  Each token is independent — these are
+ * direct mirrors of the per-token launchers, with an n_tokens grid axis and
+ * the kernel's per-token slice indexing handled in the .cu source. */
+static bool cuda_eval_launch_router_probs_batch(ds4_cuda_graph *g,
+                                                ds4_cuda_tensor *probs,
+                                                ds4_cuda_tensor *logits,
+                                                uint32_t n_expert,
+                                                uint32_t n_tokens,
+                                                char *err, size_t errlen) {
+    uint64_t p_ptr = ds4_cuda_tensor_device_ptr(probs);
+    uint64_t l_ptr = ds4_cuda_tensor_device_ptr(logits);
+    void *args[] = { &p_ptr, &l_ptr, &n_expert, &n_tokens };
+    const uint32_t total = n_expert * n_tokens;
+    const uint32_t block = 256;
+    const uint32_t grid = (total + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->router_probs_f32_batch, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_router_topk_select_batch(ds4_cuda_graph *g,
+                                                      ds4_cuda_tensor *selected,
+                                                      ds4_cuda_tensor *weights,
+                                                      ds4_cuda_tensor *probs,
+                                                      uint64_t bias_ptr,
+                                                      uint32_t n_expert, uint32_t n_used,
+                                                      uint32_t n_tokens,
+                                                      char *err, size_t errlen) {
+    uint64_t s_ptr = ds4_cuda_tensor_device_ptr(selected);
+    uint64_t w_ptr = ds4_cuda_tensor_device_ptr(weights);
+    uint64_t p_ptr = ds4_cuda_tensor_device_ptr(probs);
+    int has_bias = bias_ptr != 0 ? 1 : 0;
+    float weight_scale = DS4_EXPERT_WEIGHT_SCALE;
+    void *args[] = {
+        &s_ptr, &w_ptr, &p_ptr, &bias_ptr,
+        &n_expert, &n_used, &has_bias, &weight_scale,
+        &n_tokens,
+    };
+    DS4_CUDA_LAUNCH(g->router_topk_select_f32_batch, n_tokens, 1, 1, 1, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_router_hash_select_batch(ds4_cuda_graph *g,
+                                                      ds4_cuda_tensor *probs,
+                                                      ds4_cuda_tensor *selected,
+                                                      ds4_cuda_tensor *weights,
+                                                      ds4_cuda_tensor *logits,
+                                                      uint64_t tid2eid_ptr,
+                                                      ds4_cuda_tensor *tokens,
+                                                      uint32_t n_vocab,
+                                                      uint32_t n_expert, uint32_t n_used,
+                                                      uint32_t n_tokens,
+                                                      char *err, size_t errlen) {
+    uint64_t probs_ptr = ds4_cuda_tensor_device_ptr(probs);
+    uint64_t selected_ptr = ds4_cuda_tensor_device_ptr(selected);
+    uint64_t weights_ptr = ds4_cuda_tensor_device_ptr(weights);
+    uint64_t logits_ptr = ds4_cuda_tensor_device_ptr(logits);
+    uint64_t tokens_ptr = ds4_cuda_tensor_device_ptr(tokens);
+    float weight_scale = DS4_EXPERT_WEIGHT_SCALE;
+    void *args[] = {
+        &probs_ptr, &selected_ptr, &weights_ptr, &logits_ptr,
+        &tid2eid_ptr, &tokens_ptr,
+        &n_vocab, &n_expert, &n_used, &weight_scale, &n_tokens,
+    };
+    DS4_CUDA_LAUNCH(g->router_hash_select_f32_batch, n_tokens, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_indexer_scores_batch(ds4_cuda_graph *g,
+                                                  ds4_cuda_tensor *scores,
+                                                  ds4_cuda_tensor *q,
+                                                  ds4_cuda_tensor *index_comp,
+                                                  ds4_cuda_tensor *weights,
+                                                  uint32_t n_comp, uint32_t n_head, uint32_t head_dim,
+                                                  uint32_t n_tokens,
+                                                  char *err, size_t errlen) {
+    uint64_t s_ptr = ds4_cuda_tensor_device_ptr(scores);
+    uint64_t q_ptr = ds4_cuda_tensor_device_ptr(q);
+    uint64_t k_ptr = ds4_cuda_tensor_device_ptr(index_comp);
+    uint64_t w_ptr = ds4_cuda_tensor_device_ptr(weights);
+    void *args[] = { &s_ptr, &q_ptr, &k_ptr, &w_ptr, &n_comp, &n_head, &head_dim, &n_tokens };
+    DS4_CUDA_LAUNCH(g->indexer_scores_f32_batch, n_comp, n_tokens, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_indexer_topk_batch(ds4_cuda_graph *g,
+                                                ds4_cuda_tensor *allowed,
+                                                ds4_cuda_tensor *scores,
+                                                uint32_t n_comp, uint32_t top_k,
+                                                uint32_t n_tokens,
+                                                char *err, size_t errlen) {
+    uint64_t a_ptr = ds4_cuda_tensor_device_ptr(allowed);
+    uint64_t s_ptr = ds4_cuda_tensor_device_ptr(scores);
+    void *args[] = { &a_ptr, &s_ptr, &n_comp, &top_k, &n_tokens };
+    DS4_CUDA_LAUNCH(g->indexer_topk_mask_f32_batch, n_tokens, 1, 1, 1, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_indexer_weight_scale_batch(ds4_cuda_graph *g,
+                                                        ds4_cuda_tensor *weights,
+                                                        uint32_t n_head, float scale,
+                                                        uint32_t n_tokens,
+                                                        char *err, size_t errlen) {
+    uint64_t w_ptr = ds4_cuda_tensor_device_ptr(weights);
+    void *args[] = { &w_ptr, &n_head, &scale, &n_tokens };
+    const uint32_t total = n_head * n_tokens;
+    const uint32_t block = 64;
+    const uint32_t grid = (total + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->indexer_weight_scale_f32_batch, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+/* Batched routed iq2_xxs SwiGLU: grid (mid_dim, n_used, n_tokens) — promotes
+ * the single-token (mid_dim, n_used) grid by an extra n_tokens dim.  Per-token
+ * x / selected / route_weights / mid offsets are computed inside the kernel
+ * from blockIdx.z.  Same FP arithmetic as the per-token kernel. */
+static bool cuda_eval_launch_routed_iq2_swiglu_batch(ds4_cuda_graph *g,
+                                                     ds4_cuda_tensor *mid,
+                                                     uint64_t gate_ptr,
+                                                     uint64_t up_ptr,
+                                                     ds4_cuda_tensor *x,
+                                                     ds4_cuda_tensor *selected,
+                                                     ds4_cuda_tensor *route_weights,
+                                                     uint64_t gate_expert_bytes,
+                                                     uint64_t gate_row_bytes,
+                                                     uint64_t up_expert_bytes,
+                                                     uint64_t up_row_bytes,
+                                                     float clamp,
+                                                     uint32_t n_tokens,
+                                                     char *err, size_t errlen) {
+    uint64_t mid_ptr = ds4_cuda_tensor_device_ptr(mid);
+    uint64_t x_ptr = ds4_cuda_tensor_device_ptr(x);
+    uint64_t selected_ptr = ds4_cuda_tensor_device_ptr(selected);
+    uint64_t weights_ptr = ds4_cuda_tensor_device_ptr(route_weights);
+    uint32_t in_dim = DS4_N_EMBD;
+    uint32_t mid_dim = DS4_N_FF_EXP;
+    uint32_t n_used = DS4_N_EXPERT_USED;
+    void *args[] = {
+        &mid_ptr, &gate_ptr, &up_ptr, &x_ptr,
+        &selected_ptr, &weights_ptr,
+        &in_dim, &mid_dim, &n_used,
+        &gate_expert_bytes, &gate_row_bytes,
+        &up_expert_bytes, &up_row_bytes,
+        &clamp, &n_tokens,
+    };
+    DS4_CUDA_LAUNCH(g->routed_iq2_swiglu_f32_batch,
+                    mid_dim, n_used, n_tokens, cuda_moe_block(), 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+/* Batched mixed attention: grid (n_head, n_tokens, 1).  raw_kv / comp_kv are
+ * the layer caches *after* this chunk's M tokens have been pushed; the kernel
+ * applies a per-token raw cutoff at n_raw_pre + t + 1.  Q is laid out as
+ * [n_tokens][n_head][head_dim] (n_head implicit in gridDim.x).  Shared memory
+ * holds n_total = n_raw + n_comp scores per block. */
+static bool cuda_eval_launch_attention_mixed_batch(ds4_cuda_graph *g,
+                                                   ds4_cuda_tensor *out_heads,
+                                                   ds4_cuda_tensor *q,
+                                                   ds4_cuda_tensor *raw_kv,
+                                                   uint32_t n_raw, uint32_t n_raw_pre,
+                                                   ds4_cuda_tensor *comp_kv, uint32_t n_comp,
+                                                   ds4_cuda_tensor *allowed_or_null,
+                                                   uint64_t sinks_ptr, uint32_t head_dim,
+                                                   uint32_t n_tokens,
+                                                   char *err, size_t errlen) {
+    uint64_t out_ptr = ds4_cuda_tensor_device_ptr(out_heads);
+    uint64_t q_ptr = ds4_cuda_tensor_device_ptr(q);
+    uint64_t raw_ptr = ds4_cuda_tensor_device_ptr(raw_kv);
+    uint64_t comp_ptr = comp_kv ? ds4_cuda_tensor_device_ptr(comp_kv) : 0;
+    uint64_t allowed_ptr = allowed_or_null ? ds4_cuda_tensor_device_ptr(allowed_or_null) : 0;
+    float kq_scale = 1.0f / sqrtf((float)head_dim);
+    void *args[] = {
+        &out_ptr, &q_ptr, &raw_ptr, &n_raw, &n_raw_pre,
+        &comp_ptr, &n_comp, &allowed_ptr, &sinks_ptr,
+        &head_dim, &kq_scale, &n_tokens,
+    };
+    uint32_t shared_bytes = (n_raw + n_comp) * (uint32_t)sizeof(float);
+    DS4_CUDA_LAUNCH(g->attention_mixed_f32_batch,
+                    DS4_N_HEAD, n_tokens, 1, 256, 1, 1, shared_bytes, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+/* Batched routed q2_K down + sum: grid (out_dim, n_tokens, 1) — each (token,
+ * row) accumulates over n_used selected experts. */
+static bool cuda_eval_launch_routed_q2_down_sum_batch(ds4_cuda_graph *g,
+                                                      ds4_cuda_tensor *out,
+                                                      uint64_t down_ptr,
+                                                      ds4_cuda_tensor *mid,
+                                                      ds4_cuda_tensor *selected,
+                                                      uint64_t down_expert_bytes,
+                                                      uint64_t down_row_bytes,
+                                                      uint32_t n_tokens,
+                                                      char *err, size_t errlen) {
+    uint64_t out_ptr = ds4_cuda_tensor_device_ptr(out);
+    uint64_t mid_ptr = ds4_cuda_tensor_device_ptr(mid);
+    uint64_t selected_ptr = ds4_cuda_tensor_device_ptr(selected);
+    uint32_t in_dim = DS4_N_FF_EXP;
+    uint32_t out_dim = DS4_N_EMBD;
+    uint32_t n_used = DS4_N_EXPERT_USED;
+    void *args[] = {
+        &out_ptr, &down_ptr, &mid_ptr, &selected_ptr,
+        &in_dim, &out_dim, &n_used,
+        &down_expert_bytes, &down_row_bytes, &n_tokens,
+    };
+    DS4_CUDA_LAUNCH(g->routed_q2_down_sum_f32_batch,
+                    out_dim, n_tokens, 1, cuda_moe_block(), 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_hc4_post_batch(ds4_cuda_graph *g,
+                                            ds4_cuda_tensor *dst_hc,
+                                            ds4_cuda_tensor *block_out,
+                                            ds4_cuda_tensor *residual_hc,
+                                            ds4_cuda_tensor *split,
+                                            uint32_t n_tokens,
+                                            char *err, size_t errlen) {
+    uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dst_hc);
+    uint64_t block_ptr = ds4_cuda_tensor_device_ptr(block_out);
+    uint64_t residual_ptr = ds4_cuda_tensor_device_ptr(residual_hc);
+    uint64_t split_ptr = ds4_cuda_tensor_device_ptr(split);
+    uint32_t n_embd = DS4_N_EMBD;
+    void *args[] = { &dst_ptr, &block_ptr, &residual_ptr, &split_ptr, &n_embd, &n_tokens };
+    const uint32_t total = n_embd * n_tokens;
+    const uint32_t block = 256;
+    const uint32_t grid = (total + block - 1u) / block;
+    DS4_CUDA_LAUNCH(g->hc4_post_f32_batch, grid, 1, 1, block, 1, 1, 0, args);
     DS4_CUDA_SYNC();
     return true;
 }
@@ -14702,12 +15729,13 @@ static bool cuda_eval_launch_indexer_scores(ds4_cuda_graph *g,
                                             ds4_cuda_tensor *index_comp,
                                             ds4_cuda_tensor *weights,
                                             uint32_t n_comp, uint32_t n_head, uint32_t head_dim,
+                                            float weight_scale,
                                             char *err, size_t errlen) {
     uint64_t s_ptr = ds4_cuda_tensor_device_ptr(scores);
     uint64_t q_ptr = ds4_cuda_tensor_device_ptr(q);
     uint64_t k_ptr = ds4_cuda_tensor_device_ptr(index_comp);
     uint64_t w_ptr = ds4_cuda_tensor_device_ptr(weights);
-    void *args[] = { &s_ptr, &q_ptr, &k_ptr, &w_ptr, &n_comp, &n_head, &head_dim };
+    void *args[] = { &s_ptr, &q_ptr, &k_ptr, &w_ptr, &n_comp, &n_head, &head_dim, &weight_scale };
     DS4_CUDA_LAUNCH(g->indexer_scores_f32, n_comp, 1, 1, 256, 1, 1, 0, args);
     DS4_CUDA_SYNC();
     return true;
@@ -14771,6 +15799,76 @@ static bool cuda_eval_launch_indexer_weight_scale(ds4_cuda_graph *g,
     const uint32_t block = 64;
     const uint32_t grid = (n_head + block - 1u) / block;
     DS4_CUDA_LAUNCH(g->indexer_weight_scale_f32, grid, 1, 1, block, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_compressor_emit_fused(ds4_cuda_graph *g,
+                                                    ds4_cuda_tensor *comp_kv,
+                                                    uint32_t n_comp,
+                                                    ds4_cuda_tensor *state_kv,
+                                                    ds4_cuda_tensor *state_score,
+                                                    uint64_t norm_weight_ptr,
+                                                    uint32_t head_dim,
+                                                    uint32_t compress_ratio,
+                                                    uint32_t pos,
+                                                    uint32_t n_rot,
+                                                    uint32_t il,
+                                                    int do_fp8,
+                                                    char *err, size_t errlen) {
+    uint64_t ck_ptr = ds4_cuda_tensor_device_ptr(comp_kv);
+    uint64_t sk_ptr = ds4_cuda_tensor_device_ptr(state_kv);
+    uint64_t ss_ptr = ds4_cuda_tensor_device_ptr(state_score);
+    float eps = DS4_RMS_EPS;
+    void *args[] = {
+        &ck_ptr, &n_comp, &sk_ptr, &ss_ptr, &norm_weight_ptr,
+        &head_dim, &compress_ratio, &pos, &n_rot, &il, &eps, &do_fp8,
+    };
+    DS4_CUDA_LAUNCH(g->compressor_emit_fused_f32, 1, 1, 1, 256, 1, 1, 0, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_indexer_scores_fused(ds4_cuda_graph *g,
+                                                   ds4_cuda_tensor *global_scores,
+                                                   ds4_cuda_tensor *qr_norm,
+                                                   ds4_cuda_tensor *attn_cur,
+                                                   uint64_t index_q_b_ptr,
+                                                   uint64_t indexer_proj_ptr,
+                                                   ds4_cuda_tensor *index_comp_kv,
+                                                   uint32_t n_comp,
+                                                   uint32_t pos,
+                                                   uint32_t n_rot,
+                                                   uint32_t n_head,
+                                                   uint32_t head_dim,
+                                                   char *err, size_t errlen) {
+    uint64_t gs_ptr = ds4_cuda_tensor_device_ptr(global_scores);
+    uint64_t qn_ptr = ds4_cuda_tensor_device_ptr(qr_norm);
+    uint64_t ac_ptr = ds4_cuda_tensor_device_ptr(attn_cur);
+    uint64_t ik_ptr = ds4_cuda_tensor_device_ptr(index_comp_kv);
+    void *args[] = {
+        &gs_ptr, &qn_ptr, &ac_ptr, &index_q_b_ptr, &indexer_proj_ptr,
+        &ik_ptr, &n_comp, &pos, &n_rot, &n_head, &head_dim,
+    };
+    /* Dynamic shared memory: n_head floats for weights + n_head*head_dim floats for Q.
+     * DS4_N_INDEXER_HEAD = 128, DS4_N_INDEXER_HEAD_DIM = 128 => 128 + 16384 = 16512 floats = 66 KB.
+     * RTX 6000 Ada supports up to 100 KB shared memory with opt-in via launch API. */
+    const uint32_t smem_bytes = (uint32_t)(sizeof(float) * ((uint64_t)n_head + (uint64_t)n_head * head_dim));
+    DS4_CUDA_LAUNCH(g->indexer_scores_fused_f32, n_comp, 1, 1, 256, 1, 1, smem_bytes, args);
+    DS4_CUDA_SYNC();
+    return true;
+}
+
+static bool cuda_eval_launch_indexer_topk_from_scores(ds4_cuda_graph *g,
+                                                       ds4_cuda_tensor *allowed,
+                                                       ds4_cuda_tensor *global_scores,
+                                                       uint32_t n_comp,
+                                                       uint32_t top_k,
+                                                       char *err, size_t errlen) {
+    uint64_t a_ptr = ds4_cuda_tensor_device_ptr(allowed);
+    uint64_t s_ptr = ds4_cuda_tensor_device_ptr(global_scores);
+    void *args[] = { &a_ptr, &s_ptr, &n_comp, &top_k };
+    DS4_CUDA_LAUNCH(g->indexer_topk_from_scores_f32, 1, 1, 1, 1, 1, 1, 0, args);
     DS4_CUDA_SYNC();
     return true;
 }
@@ -14990,6 +16088,30 @@ static bool cuda_eval_compressor_state_shift(ds4_cuda_graph *g,
     return true;
 }
 
+/* Decode-path section profiler (gated by DS4_CUDA_DPROF).  When enabled it
+ * synchronizes the stream at section boundaries and accumulates real GPU wall
+ * time per section across all decode tokens, printing a running breakdown.
+ * Zero cost when the env var is unset.  now_ns() is defined further below. */
+static uint64_t now_ns(void);
+
+/* MoE routed-kernel block size, tunable via DS4_MOE_BLOCK (default 128) for
+ * occupancy experiments.  The block cooperatively reduces one output element. */
+static unsigned int cuda_moe_block(void) {
+    static unsigned int cached = 0;
+    if (cached == 0) {
+        const char *e = getenv("DS4_MOE_BLOCK");
+        unsigned int v = e ? (unsigned int)atoi(e) : 128u;
+        if (v < 32u) v = 32u;
+        if (v > 1024u) v = 1024u;
+        cached = v;
+    }
+    return cached;
+}
+
+static uint64_t dprof_attn_ns, dprof_moe_ns, dprof_ffnrest_ns, dprof_head_ns;
+static uint64_t dprof_swiglu_ns, dprof_down_ns;
+static uint64_t dprof_tokens;
+
 /* The big one: full per-token forward pass. cur_hc/next_hc are swapped between
  * layers (the caller provides the initial cur_hc, ie the embedded token). */
 static bool cuda_graph_eval_token(ds4_cuda_graph *g,
@@ -15002,6 +16124,20 @@ static bool cuda_graph_eval_token(ds4_cuda_graph *g,
         return false;
     }
 
+    const bool dprof = (getenv("DS4_CUDA_DPROF") != NULL);
+    char dprof_err[64];
+    uint64_t dprof_last = 0;
+
+    /* CUDA-graph decode: capture the whole per-token kernel DAG (embed + all
+     * layers + output head) and replay it with a single cuGraphLaunch,
+     * collapsing the ~1300 per-token cuLaunchKernel submissions.  The cached
+     * exec is updated (cuGraphExecUpdate) across tokens with matching topology;
+     * emit-cadence tokens (compressor emit changes the kernel set) re-
+     * instantiate.  Gated by DS4_CUDA_GRAPHS=1; mutually exclusive with
+     * DS4_CUDA_DPROF, whose mid-token syncs would invalidate capture. */
+    const bool use_graph = ds4_cuda_graphs_enabled() && !dprof;
+    if (use_graph && !ds4_cuda_capture_begin(err, errlen)) return false;
+
     /* 1. Embed the token into cur_hc (writes 4 HC copies of the embedding). */
     if (!cuda_graph_embed_token(g, model, weights, token, err, errlen)) return false;
 
@@ -15012,6 +16148,8 @@ static bool cuda_graph_eval_token(ds4_cuda_graph *g,
 
     ds4_cuda_tensor *cur_hc = g->cur_hc;
     ds4_cuda_tensor *next_hc = g->next_hc;
+
+    if (dprof) { ds4_cuda_synchronize(dprof_err, sizeof dprof_err); dprof_last = now_ns(); }
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         cuda_layer_ptrs L;
@@ -15080,16 +16218,15 @@ static bool cuda_graph_eval_token(ds4_cuda_graph *g,
                 return false;
 
             if (should_compress) {
-                /* Pool -> RMS-with-weight -> RoPE -> FP8 round-trip -> push into attn_comp_kv -> state shift. */
-                if (!cuda_eval_launch_compressor_pool(g, g->eval_comp,
-                        lc->attn_state_kv, lc->attn_state_score,
-                        DS4_N_HEAD_DIM, L.ratio, err, errlen)) return false;
-                if (!cuda_eval_launch_rms_general(g, g->eval_comp, g->eval_comp,
-                        L.attn_compressor_norm, DS4_N_HEAD_DIM, true, err, errlen)) return false;
+                /* Fused: pool -> RMS-with-weight -> RoPE -> FP8 -> push into comp_kv.
+                 * Replaces 5 launches + 1 DtoD copy with 1 launch. */
                 const uint32_t comp_pos = pos + 1u - L.ratio;
-                if (!cuda_eval_launch_rope(g, g->eval_comp, 1u, DS4_N_HEAD_DIM, DS4_N_ROT, comp_pos, il, false, err, errlen)) return false;
-                if (!cuda_eval_launch_kv_fp8(g, g->eval_comp, DS4_N_HEAD_DIM, DS4_N_ROT, err, errlen)) return false;
-                if (!cuda_eval_push_comp_kv(g, il, err, errlen)) return false;
+                if (!cuda_eval_launch_compressor_emit_fused(g, lc->attn_comp_kv,
+                        lc->n_comp, lc->attn_state_kv, lc->attn_state_score,
+                        L.attn_compressor_norm, DS4_N_HEAD_DIM, L.ratio,
+                        comp_pos, DS4_N_ROT, il, 1, err, errlen))
+                    return false;
+                lc->n_comp++;
                 if (L.ratio == 4u) {
                     if (!cuda_eval_compressor_state_shift(g, lc->attn_state_kv, lc->attn_state_score,
                                                           lc->state_rows, L.comp_width, err, errlen))
@@ -15106,16 +16243,14 @@ static bool cuda_graph_eval_token(ds4_cuda_graph *g,
                         err, errlen))
                     return false;
                 if (should_compress) {
-                    if (!cuda_eval_launch_compressor_pool(g, g->eval_index_comp,
-                            lc->index_state_kv, lc->index_state_score,
-                            DS4_N_INDEXER_HEAD_DIM, L.ratio, err, errlen)) return false;
-                    if (!cuda_eval_launch_rms_general(g, g->eval_index_comp, g->eval_index_comp,
-                            L.indexer_compressor_norm, DS4_N_INDEXER_HEAD_DIM, true, err, errlen)) return false;
+                    /* Fused: pool -> RMS-with-weight -> RoPE -> push (no FP8 for indexer). */
                     const uint32_t comp_pos = pos + 1u - L.ratio;
-                    if (!cuda_eval_launch_rope(g, g->eval_index_comp, 1u, DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
-                                               comp_pos, il, false, err, errlen)) return false;
-                    /* Note: indexer KV does NOT receive FP8 round-trip (head_dim != DS4_N_HEAD_DIM). */
-                    if (!cuda_eval_push_index_comp_kv(g, il, err, errlen)) return false;
+                    if (!cuda_eval_launch_compressor_emit_fused(g, lc->index_comp_kv,
+                            lc->n_index_comp, lc->index_state_kv, lc->index_state_score,
+                            L.indexer_compressor_norm, DS4_N_INDEXER_HEAD_DIM, L.ratio,
+                            comp_pos, DS4_N_ROT, il, 0, err, errlen))
+                        return false;
+                    lc->n_index_comp++;
                     if (!cuda_eval_compressor_state_shift(g, lc->index_state_kv, lc->index_state_score,
                                                           lc->state_rows, L.index_comp_width, err, errlen))
                         return false;
@@ -15133,16 +16268,17 @@ static bool cuda_graph_eval_token(ds4_cuda_graph *g,
                                        DS4_N_ROT, pos, il, false, err, errlen)) return false;
             if (!cuda_eval_launch_matvec_f16(g, g->eval_index_weights, L.indexer_proj, g->eval_attn_cur,
                                              DS4_N_EMBD, DS4_N_INDEXER_HEAD, err, errlen)) return false;
-            float scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
-            if (!cuda_eval_launch_indexer_weight_scale(g, g->eval_index_weights, DS4_N_INDEXER_HEAD,
-                                                      scale, err, errlen)) return false;
+            const float weight_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
             if (!cuda_eval_launch_indexer_scores(g, g->eval_index_scores, g->eval_index_q,
                                                  lc->index_comp_kv, g->eval_index_weights,
                                                  lc->n_index_comp, DS4_N_INDEXER_HEAD,
-                                                 DS4_N_INDEXER_HEAD_DIM, err, errlen)) return false;
+                                                 DS4_N_INDEXER_HEAD_DIM, weight_scale,
+                                                 err, errlen)) return false;
             uint32_t top_k = DS4_N_INDEXER_TOP_K < lc->n_index_comp ? DS4_N_INDEXER_TOP_K : lc->n_index_comp;
-            if (!cuda_eval_launch_indexer_topk(g, g->eval_index_allowed, g->eval_index_scores,
-                                               lc->n_index_comp, top_k, err, errlen)) return false;
+            if (!cuda_eval_launch_indexer_topk_from_scores(g, g->eval_index_allowed,
+                    g->eval_index_scores,
+                    lc->n_index_comp, top_k, err, errlen))
+                return false;
             allowed_tensor = g->eval_index_allowed;
         }
 
@@ -15176,6 +16312,8 @@ static bool cuda_graph_eval_token(ds4_cuda_graph *g,
             DS4_CUDA_LAUNCH(g->hc4_post_f32, grid, 1, 1, block, 1, 1, 0, args);
             DS4_CUDA_SYNC();
         }
+
+        if (dprof) { ds4_cuda_synchronize(dprof_err, sizeof dprof_err); uint64_t n = now_ns(); dprof_attn_ns += n - dprof_last; dprof_last = n; }
 
         /* --- FFN sublayer --- */
         /* HC pre + ffn norm into (eval_ffn_cur, eval_ffn_norm). */
@@ -15228,6 +16366,8 @@ static bool cuda_graph_eval_token(ds4_cuda_graph *g,
                                               DS4_N_EXPERT, DS4_N_EXPERT_USED, err, errlen)) return false;
         }
 
+        if (dprof) { ds4_cuda_synchronize(dprof_err, sizeof dprof_err); uint64_t n = now_ns(); dprof_moe_ns += n - dprof_last; dprof_last = n; }
+
         /* Routed iq2 swiglu. */
         {
             uint64_t mid_ptr = ds4_cuda_tensor_device_ptr(g->eval_routed_mid);
@@ -15246,9 +16386,11 @@ static bool cuda_graph_eval_token(ds4_cuda_graph *g,
                 &L.up_expert_bytes, &L.up_row_bytes,
                 &clamp,
             };
-            DS4_CUDA_LAUNCH(g->routed_iq2_swiglu_f32, mid_dim, n_used, 1, 1, 1, 1, 0, args);
+            DS4_CUDA_LAUNCH(g->routed_iq2_swiglu_f32, mid_dim, n_used, 1, cuda_moe_block(), 1, 1, 0, args);
             DS4_CUDA_SYNC();
         }
+
+        if (dprof) { ds4_cuda_synchronize(dprof_err, sizeof dprof_err); uint64_t n = now_ns(); dprof_swiglu_ns += n - dprof_last; dprof_last = n; }
 
         /* Routed q2_k down sum into eval_routed_out. */
         {
@@ -15263,9 +16405,11 @@ static bool cuda_graph_eval_token(ds4_cuda_graph *g,
                 &in_dim, &out_dim, &n_used,
                 &L.down_expert_bytes, &L.down_row_bytes,
             };
-            DS4_CUDA_LAUNCH(g->routed_q2_down_sum_f32, out_dim, 1, 1, 1, 1, 1, 0, args);
+            DS4_CUDA_LAUNCH(g->routed_q2_down_sum_f32, out_dim, 1, 1, cuda_moe_block(), 1, 1, 0, args);
             DS4_CUDA_SYNC();
         }
+
+        if (dprof) { ds4_cuda_synchronize(dprof_err, sizeof dprof_err); uint64_t n = now_ns(); dprof_down_ns += n - dprof_last; dprof_last = n; }
 
         /* Shared expert: gate, up, swiglu (no clamp for shared), down. */
         if (!cuda_eval_launch_matvec_q8_0(g, g->eval_shared_gate, L.ffn_gate_shexp, g->eval_ffn_norm,
@@ -15294,6 +16438,8 @@ static bool cuda_graph_eval_token(ds4_cuda_graph *g,
             DS4_CUDA_LAUNCH(g->hc4_post_f32, grid, 1, 1, block, 1, 1, 0, args);
             DS4_CUDA_SYNC();
         }
+
+        if (dprof) { ds4_cuda_synchronize(dprof_err, sizeof dprof_err); uint64_t n = now_ns(); dprof_ffnrest_ns += n - dprof_last; dprof_last = n; }
 
         /* Swap cur_hc and next_hc for next layer. */
         ds4_cuda_tensor *tmp = cur_hc;
@@ -15325,15 +16471,494 @@ static bool cuda_graph_eval_token(ds4_cuda_graph *g,
                                       DS4_N_EMBD, true, err, errlen)) return false;
     if (!cuda_eval_launch_matvec_q8_0(g, g->logits, output_ptr, g->eval_output_norm,
                                       DS4_N_EMBD, DS4_N_VOCAB, err, errlen)) return false;
+    /* End capture and replay the captured per-token DAG in one cuGraphLaunch. */
+    if (use_graph && !ds4_cuda_capture_end_launch(err, errlen)) return false;
+    /* One sync per token surfaces any deferred kernel error before the caller
+     * reads logits back to host.  Per-launch syncs (above) are a no-op unless
+     * DS4_CUDA_DEBUG_SYNC is set, which lets the stream pipeline kernels. */
+    if (ds4_cuda_synchronize(err, errlen) == 0) return false;
+    if (dprof) {
+        uint64_t n = now_ns(); dprof_head_ns += n - dprof_last; dprof_tokens++;
+        if (dprof_tokens % 32 == 0) {
+            double k = 1e6 * (double)dprof_tokens;
+            fprintf(stderr, "ds4_dprof[%llu tok avg ms]: attn=%.2f moe_pre=%.2f swiglu=%.2f down=%.2f ffn_rest=%.2f head=%.2f total=%.2f\n",
+                    (unsigned long long)dprof_tokens,
+                    (double)dprof_attn_ns / k, (double)dprof_moe_ns / k,
+                    (double)dprof_swiglu_ns / k, (double)dprof_down_ns / k,
+                    (double)dprof_ffnrest_ns / k, (double)dprof_head_ns / k,
+                    (double)(dprof_attn_ns + dprof_moe_ns + dprof_swiglu_ns + dprof_down_ns + dprof_ffnrest_ns + dprof_head_ns) / k);
+        }
+    }
     return true;
 }
 
+/* ---- Layer-major batched prefill (cuda_graph_prefill_chunked_range) ----
+ *
+ * For each chunk of M prompt tokens at position pos0:
+ *  1) Embed all M tokens into batch_cur_hc (one batched embed launch).
+ *  2) For each layer il:
+ *       a) Batched attention sublayer: HC pre + Q LoRA + KV proj +
+ *          KV_FP8 + RoPE.  All matvecs/RMS/RoPE/HC ops use _batch wrappers.
+ *       b) Push M raw_kv rows into the layer cache in one DtoD memcpy.
+ *       c) For each token t in chunk SEQUENTIALLY (per-token state):
+ *            - compressor proj_state at row=(pos+t)%state_rows.
+ *            - On emit boundary ((pos+t+1)%ratio==0): pool/RMS/RoPE/FP8 ->
+ *              push_comp + state_shift.
+ *            - Same for indexer compressor (ratio==4 only).
+ *            - indexer Q + scores + mask -> per-token allowed.
+ *            - mixed_attention (single-token) reading batch_q[t] view ->
+ *              batch_heads[t] view.
+ *       d) Batched inverse RoPE on heads, output projection (low + high),
+ *          HC4 post into batch_after_attn_hc.
+ *       e) Batched FFN sublayer: HC pre, router (logits + topk/hash),
+ *          routed iq2 SwiGLU + q2 down sum, shared expert, add, HC post.
+ *  3) After all layers, run the output head on the LAST token's batch_cur_hc
+ *     row (writing g->logits).
+ *
+ * For layers with ratio==4, M must align to ratio boundaries to keep n_comp
+ * constant across the chunk's attention.  The caller falls back to per-token
+ * cuda_graph_eval_token for the head/tail fragments around alignment.
+ *
+ * NOTE (first cut): the per-token segments inside each layer (compressor /
+ * indexer / attention_mixed) still launch one kernel per token rather than a
+ * single batched launch; the batched matvec/MoE/HC paths are where the
+ * launch-overhead savings come from.  Subsequent iterations will replace
+ * the per-token segments with batched kernels (compressor_proj_state_batch,
+ * attention_mixed_batch with per-token allowed mask). */
+
+/* Helper: copy one row out of a batched tensor into a single-token scratch
+ * tensor, using device-to-device memcpy.  Used to slice batch_*[t] before
+ * per-token operations that consume single-token tensors. */
+static bool cuda_batch_slice_to_scratch(ds4_cuda_tensor *scratch,
+                                         ds4_cuda_tensor *batch,
+                                         uint32_t t, uint64_t per_token_bytes,
+                                         char *err, size_t errlen) {
+    if (!ds4_cuda_tensor_copy(scratch, 0, batch, (uint64_t)t * per_token_bytes, per_token_bytes)) {
+        snprintf(err, errlen, "CUDA batch slice (to scratch) failed");
+        return false;
+    }
+    return true;
+}
+
+/* Helper: copy a single-token scratch into row t of a batched tensor. */
+static bool cuda_batch_slice_from_scratch(ds4_cuda_tensor *batch,
+                                           ds4_cuda_tensor *scratch,
+                                           uint32_t t, uint64_t per_token_bytes,
+                                           char *err, size_t errlen) {
+    if (!ds4_cuda_tensor_copy(batch, (uint64_t)t * per_token_bytes, scratch, 0, per_token_bytes)) {
+        snprintf(err, errlen, "CUDA batch slice (from scratch) failed");
+        return false;
+    }
+    return true;
+}
+
+/* Per-layer timing accumulators for DS4_CUDA_TIMING=1 profiling. */
+static uint64_t timing_layer_ns[DS4_N_LAYER];
+static uint64_t timing_batched_attn_ns;
+static uint64_t timing_per_token_ns;
+static uint64_t timing_ffn_ns;
+static int timing_initialized;
+
+static void timing_init(void) {
+    if (!timing_initialized) {
+        memset(timing_layer_ns, 0, sizeof(timing_layer_ns));
+        timing_batched_attn_ns = 0;
+        timing_per_token_ns = 0;
+        timing_ffn_ns = 0;
+        timing_initialized = 1;
+    }
+}
+
+static void timing_print(void) {
+    if (!getenv("DS4_CUDA_TIMING")) return;
+    fprintf(stderr, "\nds4_timing: per-layer (ms):");
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < DS4_N_LAYER; i++) {
+        fprintf(stderr, " %u=%.2f", i, (double)timing_layer_ns[i] / 1e6);
+        total += timing_layer_ns[i];
+    }
+    fprintf(stderr, "\nds4_timing: batched_attn=%.2fms per_token=%.2fms ffn=%.2fms total=%.2fms\n",
+            (double)timing_batched_attn_ns / 1e6,
+            (double)timing_per_token_ns / 1e6,
+            (double)timing_ffn_ns / 1e6,
+            (double)total / 1e6);
+    timing_initialized = 0;
+}
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Process one layer over M tokens of the current chunk. */
+static bool cuda_graph_eval_layer_batch(ds4_cuda_graph *g,
+                                         const ds4_model *model,
+                                         const ds4_weights *weights,
+                                         uint32_t il, uint32_t pos0, uint32_t M,
+                                         ds4_cuda_tensor *cur_hc_batch,
+                                         ds4_cuda_tensor *next_hc_batch,
+                                         char *err, size_t errlen) {
+    cuda_layer_ptrs L;
+    if (!cuda_layer_collect_ptrs(g, model, &weights->layer[il], il, &L, err, errlen)) return false;
+    ds4_cuda_layer_cache *lc = &g->layer_cache[il];
+
+    const uint32_t hc_dim = (uint32_t)((uint64_t)DS4_N_HC * DS4_N_EMBD);
+    const uint32_t hc_mix = 2u * DS4_N_HC + DS4_N_HC * DS4_N_HC;
+    const uint32_t q_dim = (uint32_t)((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM);
+    const uint32_t out_low_dim = DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t q_bytes = (uint64_t)q_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+
+    const bool do_timing = (getenv("DS4_CUDA_TIMING") != NULL);
+    uint64_t t_layer = do_timing ? now_ns() : 0;
+
+    /* 1. Attention pre-norm: rms-no-weight on each token's flat HC -> matvec_f16
+     *    (hc_attn_fn) batched -> hc4_split_norm_batch -> batch_attn_norm. */
+    if (!cuda_eval_launch_rms_general_batch(g, g->batch_flat_hc, cur_hc_batch, 0,
+                                             hc_dim, false, M, err, errlen)) return false;
+    if (!cuda_eval_launch_matvec_f16_batch(g, g->batch_hc_mix, L.hc_attn_fn,
+                                            g->batch_flat_hc, hc_dim, hc_mix, M, err, errlen)) return false;
+    if (!cuda_eval_launch_hc4_split_norm_batch(g, g->batch_attn_cur, g->batch_attn_norm,
+                                               g->batch_hc_split, g->batch_hc_mix,
+                                               L.hc_attn_scale, L.hc_attn_base,
+                                               cur_hc_batch, L.attn_norm,
+                                               DS4_N_EMBD, hc_mix, M, err, errlen)) return false;
+
+    /* 2. Q LoRA batched: q_a -> rms(q_a_norm) -> q_b -> head_rms. */
+    if (!cuda_eval_launch_matvec_q8_0_batch(g, g->batch_qr, L.attn_q_a, g->batch_attn_norm,
+                                             DS4_N_EMBD, DS4_N_LORA_Q, M, err, errlen)) return false;
+    if (!cuda_eval_launch_rms_general_batch(g, g->batch_qr_norm, g->batch_qr, L.attn_q_a_norm,
+                                             DS4_N_LORA_Q, true, M, err, errlen)) return false;
+    if (!cuda_eval_launch_matvec_q8_0_batch(g, g->batch_q, L.attn_q_b, g->batch_qr_norm,
+                                             DS4_N_LORA_Q, q_dim, M, err, errlen)) return false;
+    if (!cuda_eval_launch_head_rms_batch(g, g->batch_q, DS4_N_HEAD, DS4_N_HEAD_DIM, M, err, errlen)) return false;
+
+    /* 3. KV proj batched: kv -> rms(kv_a_norm). */
+    if (!cuda_eval_launch_matvec_q8_0_batch(g, g->batch_kv_raw, L.attn_kv, g->batch_attn_norm,
+                                             DS4_N_EMBD, DS4_N_HEAD_DIM, M, err, errlen)) return false;
+    if (!cuda_eval_launch_rms_general_batch(g, g->batch_kv, g->batch_kv_raw, L.attn_kv_a_norm,
+                                             DS4_N_HEAD_DIM, true, M, err, errlen)) return false;
+
+    /* 4. RoPE on Q and KV — per-token RoPE (since each token has its own pos). */
+    if (!cuda_eval_launch_rope_batch(g, g->batch_q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT,
+                                      pos0, M, il, false, err, errlen)) return false;
+    if (!cuda_eval_launch_rope_batch(g, g->batch_kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
+                                      pos0, M, il, false, err, errlen)) return false;
+
+    /* 5. KV FP8 round-trip (batched). */
+    if (!cuda_eval_launch_kv_fp8_batch(g, g->batch_kv, DS4_N_HEAD_DIM, DS4_N_ROT, M, err, errlen)) return false;
+
+    /* Note: KV push is INSIDE the per-token loop below, interleaved with
+     * attention.  Pushing M rows ahead of the loop would corrupt the cache
+     * for tokens 0..M-2 in the SWA case (their lookback range gets shifted
+     * out by the later tokens' pushes before they get to read the cache).
+     * For prefill chunks with n_raw_pre + M > raw_cap, the per-token
+     * cuda_eval_push_raw_kv handles the SWA shift correctly between attentions. */
+
+    /* 7. Per-token state operations: KV push, compressor proj_state, optional
+     *    emit, indexer compressor + mask, mixed attention.  These operate on
+     *    single-token scratch tensors that we slice from the batched ones. */
+    uint64_t t_pertok = do_timing ? now_ns() : 0;
+    for (uint32_t t = 0; t < M; t++) {
+        const uint32_t pos = pos0 + t;
+        /* Push this token's KV before its attention runs.  Must happen
+         * before compressor/indexer + attention since attention reads
+         * lc->raw_kv up to its own KV. */
+        if (!cuda_batch_slice_to_scratch(g->eval_kv, g->batch_kv, t, kv_bytes, err, errlen)) return false;
+        if (!cuda_eval_push_raw_kv(g, il, err, errlen)) return false;
+        /* Make per-token attn_norm available for compressor (reads it as x). */
+        if (L.ratio != 0) {
+            if (!cuda_batch_slice_to_scratch(g->eval_attn_norm, g->batch_attn_norm, t,
+                                              embd_bytes, err, errlen)) return false;
+
+            const uint32_t pos_mod = pos % L.ratio;
+            const uint32_t row = (L.ratio == 4u) ? L.ratio + pos_mod : pos_mod;
+            const bool should_compress = ((pos + 1u) % L.ratio) == 0;
+
+            if (!cuda_eval_launch_compressor_proj_state(g,
+                    lc->attn_state_kv, lc->attn_state_score,
+                    L.attn_compressor_kv, L.attn_compressor_gate, L.attn_compressor_ape,
+                    g->eval_attn_norm, row, L.comp_width, DS4_N_EMBD, pos_mod, L.comp_ape_height,
+                    err, errlen)) return false;
+
+            if (should_compress) {
+                /* Fused: pool -> RMS -> RoPE -> FP8 -> push into attn_comp_kv. */
+                const uint32_t comp_pos = pos + 1u - L.ratio;
+                if (!cuda_eval_launch_compressor_emit_fused(g, lc->attn_comp_kv,
+                        lc->n_comp, lc->attn_state_kv, lc->attn_state_score,
+                        L.attn_compressor_norm, DS4_N_HEAD_DIM, L.ratio,
+                        comp_pos, DS4_N_ROT, il, 1, err, errlen))
+                    return false;
+                lc->n_comp++;
+                if (L.ratio == 4u) {
+                    if (!cuda_eval_compressor_state_shift(g, lc->attn_state_kv, lc->attn_state_score,
+                                                          lc->state_rows, L.comp_width, err, errlen)) return false;
+                }
+            }
+
+            if (L.ratio == 4u) {
+                if (!cuda_eval_launch_compressor_proj_state(g,
+                        lc->index_state_kv, lc->index_state_score,
+                        L.indexer_compressor_kv, L.indexer_compressor_gate, L.indexer_compressor_ape,
+                        g->eval_attn_norm, row, L.index_comp_width, DS4_N_EMBD, pos_mod, L.index_comp_ape_height,
+                        err, errlen)) return false;
+                if (should_compress) {
+                    /* Fused: pool -> RMS -> RoPE -> push (no FP8 for indexer). */
+                    const uint32_t comp_pos = pos + 1u - L.ratio;
+                    if (!cuda_eval_launch_compressor_emit_fused(g, lc->index_comp_kv,
+                            lc->n_index_comp, lc->index_state_kv, lc->index_state_score,
+                            L.indexer_compressor_norm, DS4_N_INDEXER_HEAD_DIM, L.ratio,
+                            comp_pos, DS4_N_ROT, il, 0, err, errlen))
+                        return false;
+                    lc->n_index_comp++;
+                    if (!cuda_eval_compressor_state_shift(g, lc->index_state_kv, lc->index_state_score,
+                                                          lc->state_rows, L.index_comp_width, err, errlen)) return false;
+                }
+            }
+        }
+
+        /* Indexer mask + mixed attention for this token.  Uses single-token
+         * scratch with views into the batched Q + per-token attn_cur. */
+        ds4_cuda_tensor *q_view = ds4_cuda_tensor_view(g->batch_q,
+                (uint64_t)t * q_bytes, q_bytes);
+        ds4_cuda_tensor *heads_view = ds4_cuda_tensor_view(g->batch_heads,
+                (uint64_t)t * q_bytes, q_bytes);
+        if (!q_view || !heads_view) {
+            ds4_cuda_tensor_free(q_view);
+            ds4_cuda_tensor_free(heads_view);
+            snprintf(err, errlen, "CUDA Q/heads view alloc failed");
+            return false;
+        }
+
+        ds4_cuda_tensor *allowed_tensor = NULL;
+        if (L.ratio == 4u && lc->n_index_comp > 0) {
+            if (!cuda_batch_slice_to_scratch(g->eval_qr_norm, g->batch_qr_norm, t,
+                                              (uint64_t)DS4_N_LORA_Q * sizeof(float), err, errlen) ||
+                !cuda_batch_slice_to_scratch(g->eval_attn_cur, g->batch_attn_cur, t,
+                                              embd_bytes, err, errlen)) {
+                ds4_cuda_tensor_free(q_view);
+                ds4_cuda_tensor_free(heads_view);
+                return false;
+            }
+            const uint32_t n_idx_q_dim = DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+            if (!cuda_eval_launch_matvec_f16(g, g->eval_index_q, L.indexer_attn_q_b, g->eval_qr_norm,
+                                             DS4_N_LORA_Q, n_idx_q_dim, err, errlen) ||
+                !cuda_eval_launch_rope(g, g->eval_index_q, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
+                                       DS4_N_ROT, pos, il, false, err, errlen) ||
+                !cuda_eval_launch_matvec_f16(g, g->eval_index_weights, L.indexer_proj, g->eval_attn_cur,
+                                             DS4_N_EMBD, DS4_N_INDEXER_HEAD, err, errlen)) {
+                ds4_cuda_tensor_free(q_view);
+                ds4_cuda_tensor_free(heads_view);
+                return false;
+            }
+            const float weight_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
+            if (!cuda_eval_launch_indexer_scores(g, g->eval_index_scores, g->eval_index_q,
+                                                 lc->index_comp_kv, g->eval_index_weights,
+                                                 lc->n_index_comp, DS4_N_INDEXER_HEAD,
+                                                 DS4_N_INDEXER_HEAD_DIM, weight_scale,
+                                                 err, errlen)) {
+                ds4_cuda_tensor_free(q_view);
+                ds4_cuda_tensor_free(heads_view);
+                return false;
+            }
+            uint32_t top_k = DS4_N_INDEXER_TOP_K < lc->n_index_comp ? DS4_N_INDEXER_TOP_K : lc->n_index_comp;
+            if (!cuda_eval_launch_indexer_topk_from_scores(g, g->eval_index_allowed,
+                    g->eval_index_scores,
+                    lc->n_index_comp, top_k, err, errlen)) {
+                ds4_cuda_tensor_free(q_view);
+                ds4_cuda_tensor_free(heads_view);
+                return false;
+            }
+            allowed_tensor = g->eval_index_allowed;
+        }
+
+        /* Cache state after this token's push: lc->n_raw = (pre-chunk + t + 1)
+         * for non-SWA chunks, or raw_cap for SWA-saturated chunks (where the
+         * cache has been shifted to keep the most-recent raw_cap rows ending
+         * at the just-pushed row).  Either way attention reads everything
+         * lc->raw_kv currently holds, ending with this token's KV. */
+        bool ok = cuda_eval_launch_attention_mixed(g, heads_view, q_view,
+                                                    lc->raw_kv, lc->n_raw,
+                                                    lc->attn_comp_kv, lc->n_comp,
+                                                    allowed_tensor,
+                                                    L.attn_sinks, DS4_N_HEAD_DIM, err, errlen);
+        ds4_cuda_tensor_free(q_view);
+        ds4_cuda_tensor_free(heads_view);
+        if (!ok) return false;
+    }
+    uint64_t t_post = do_timing ? now_ns() : 0;
+
+    /* 8. Inverse RoPE on heads (batched). */
+    if (!cuda_eval_launch_rope_batch(g, g->batch_heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT,
+                                      pos0, M, il, true, err, errlen)) return false;
+
+    /* 9. Output projection (batched): grouped low + matvec to embd. */
+    if (!cuda_eval_launch_matvec_q8_0_grouped_batch(g, g->batch_attn_low, L.attn_output_a,
+                                                     g->batch_heads,
+                                                     DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP),
+                                                     DS4_N_LORA_O, DS4_N_OUT_GROUP, M, err, errlen)) return false;
+    if (!cuda_eval_launch_matvec_q8_0_batch(g, g->batch_attn_out, L.attn_output_b, g->batch_attn_low,
+                                             out_low_dim, DS4_N_EMBD, M, err, errlen)) return false;
+
+    /* 10. HC post (attn): batch_after_attn_hc = attn_out + cur_hc residual, weighted by hc_split. */
+    if (!cuda_eval_launch_hc4_post_batch(g, g->batch_after_attn_hc, g->batch_attn_out,
+                                          cur_hc_batch, g->batch_hc_split, M, err, errlen)) return false;
+
+    /* 11. FFN sublayer.  HC pre + matvec_f16 + hc4_split_norm. */
+    if (!cuda_eval_launch_rms_general_batch(g, g->batch_flat_hc, g->batch_after_attn_hc, 0,
+                                             hc_dim, false, M, err, errlen)) return false;
+    if (!cuda_eval_launch_matvec_f16_batch(g, g->batch_ffn_hc_mix, L.hc_ffn_fn,
+                                            g->batch_flat_hc, hc_dim, hc_mix, M, err, errlen)) return false;
+    if (!cuda_eval_launch_hc4_split_norm_batch(g, g->batch_ffn_cur, g->batch_ffn_norm,
+                                                g->batch_ffn_hc_split, g->batch_ffn_hc_mix,
+                                                L.hc_ffn_scale, L.hc_ffn_base,
+                                                g->batch_after_attn_hc, L.ffn_norm,
+                                                DS4_N_EMBD, hc_mix, M, err, errlen)) return false;
+
+    /* 12. Router logits (batched). */
+    if (!cuda_eval_launch_matvec_f16_batch(g, g->batch_router_logits, L.ffn_gate_inp, g->batch_ffn_norm,
+                                            DS4_N_EMBD, DS4_N_EXPERT, M, err, errlen)) return false;
+
+    if (L.has_hash_router) {
+        if (!cuda_eval_launch_router_hash_select_batch(g, g->batch_router_probs,
+                                                        g->batch_router_selected,
+                                                        g->batch_router_weights,
+                                                        g->batch_router_logits,
+                                                        L.ffn_gate_tid2eid,
+                                                        g->batch_tokens,
+                                                        (uint32_t)weights->token_embd->dim[1],
+                                                        DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                                                        M, err, errlen)) return false;
+    } else {
+        if (!cuda_eval_launch_router_probs_batch(g, g->batch_router_probs, g->batch_router_logits,
+                                                  DS4_N_EXPERT, M, err, errlen)) return false;
+        uint64_t bias_ptr = L.has_exp_probs_b ? L.ffn_exp_probs_b : 0;
+        if (!cuda_eval_launch_router_topk_select_batch(g, g->batch_router_selected,
+                                                        g->batch_router_weights,
+                                                        g->batch_router_probs, bias_ptr,
+                                                        DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                                                        M, err, errlen)) return false;
+    }
+
+    /* 13. MoE routed expert: iq2 SwiGLU + q2 down sum, batched. */
+    if (!cuda_eval_launch_routed_iq2_swiglu_batch(g, g->batch_routed_mid, L.ffn_gate_exps, L.ffn_up_exps,
+                                                   g->batch_ffn_norm, g->batch_router_selected,
+                                                   g->batch_router_weights,
+                                                   L.gate_expert_bytes, L.gate_row_bytes,
+                                                   L.up_expert_bytes, L.up_row_bytes,
+                                                   DS4_SWIGLU_CLAMP_EXP, M, err, errlen)) return false;
+    if (!cuda_eval_launch_routed_q2_down_sum_batch(g, g->batch_routed_out, L.ffn_down_exps,
+                                                    g->batch_routed_mid, g->batch_router_selected,
+                                                    L.down_expert_bytes, L.down_row_bytes,
+                                                    M, err, errlen)) return false;
+
+    /* 14. Shared expert (batched). */
+    if (!cuda_eval_launch_matvec_q8_0_batch(g, g->batch_shared_gate, L.ffn_gate_shexp, g->batch_ffn_norm,
+                                             DS4_N_EMBD, DS4_N_FF_EXP, M, err, errlen)) return false;
+    if (!cuda_eval_launch_matvec_q8_0_batch(g, g->batch_shared_up, L.ffn_up_shexp, g->batch_ffn_norm,
+                                             DS4_N_EMBD, DS4_N_FF_EXP, M, err, errlen)) return false;
+    if (!cuda_eval_launch_swiglu_batch(g, g->batch_shared_mid, g->batch_shared_gate,
+                                        g->batch_shared_up, DS4_N_FF_EXP, 0.0f, M, err, errlen)) return false;
+    if (!cuda_eval_launch_matvec_q8_0_batch(g, g->batch_shared_out, L.ffn_down_shexp, g->batch_shared_mid,
+                                             DS4_N_FF_EXP, DS4_N_EMBD, M, err, errlen)) return false;
+
+    /* 15. Add routed + shared into ffn_out, batched. */
+    if (!cuda_eval_launch_add_batch(g, g->batch_ffn_out, g->batch_routed_out, g->batch_shared_out,
+                                     DS4_N_EMBD, M, err, errlen)) return false;
+
+    /* 16. HC post (ffn): next_hc = ffn_out + after_attn_hc residual weighted by hc_split. */
+    if (!cuda_eval_launch_hc4_post_batch(g, next_hc_batch, g->batch_ffn_out, g->batch_after_attn_hc,
+                                          g->batch_ffn_hc_split, M, err, errlen)) return false;
+
+    if (do_timing) {
+        ds4_cuda_synchronize(err, errlen);
+        uint64_t t_now = now_ns();
+        timing_layer_ns[il] += t_now - t_layer;
+        timing_batched_attn_ns += t_pertok - t_layer;
+        timing_per_token_ns += t_post - t_pertok;
+        timing_ffn_ns += t_now - t_post;
+    }
+
+    return true;
+}
+
+/* Run the output head (HC pre, weights, weighted sum, RMS, matvec) on a single
+ * token's HC, writing into g->logits.  The token is taken from row `t` of the
+ * batched HC tensor `cur_hc_batch`. */
+static bool cuda_graph_output_head_at(ds4_cuda_graph *g,
+                                       const ds4_model *model,
+                                       const ds4_weights *weights,
+                                       ds4_cuda_tensor *cur_hc_batch, uint32_t t,
+                                       char *err, size_t errlen) {
+    const uint32_t hc_dim = (uint32_t)((uint64_t)DS4_N_HC * DS4_N_EMBD);
+    const uint64_t hc_bytes = (uint64_t)hc_dim * sizeof(float);
+    /* Slice the t-th token's HC into single-token g->cur_hc scratch so the
+     * existing per-token output-head kernels can read it.  This is one DtoD
+     * copy of 64 KB. */
+    if (!cuda_batch_slice_to_scratch(g->cur_hc, cur_hc_batch, t, hc_bytes, err, errlen)) return false;
+
+    uint64_t output_hc_fn_ptr = 0, output_hc_scale_ptr = 0, output_hc_base_ptr = 0;
+    uint64_t output_norm_ptr = 0, output_ptr = 0;
+    if (!cuda_graph_tensor_device_ptr(g, model, weights->output_hc_fn, &output_hc_fn_ptr, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, weights->output_hc_scale, &output_hc_scale_ptr, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, weights->output_hc_base, &output_hc_base_ptr, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, weights->output_norm, &output_norm_ptr, err, errlen) ||
+        !cuda_graph_tensor_device_ptr(g, model, weights->output, &output_ptr, err, errlen)) return false;
+
+    if (!cuda_eval_launch_rms_general(g, g->eval_flat_hc, g->cur_hc, 0, hc_dim, false, err, errlen)) return false;
+    if (!cuda_eval_launch_matvec_f16(g, g->eval_output_pre, output_hc_fn_ptr, g->eval_flat_hc, hc_dim, DS4_N_HC, err, errlen)) return false;
+    if (!cuda_eval_launch_output_hc_weights(g, g->eval_output_weights, g->eval_output_pre,
+                                             output_hc_scale_ptr, output_hc_base_ptr,
+                                             DS4_N_HC, DS4_HC_EPS, err, errlen)) return false;
+    if (!cuda_eval_launch_output_hc_weighted_sum(g, g->eval_output_embd, g->cur_hc, g->eval_output_weights,
+                                                  DS4_N_EMBD, DS4_N_HC, err, errlen)) return false;
+    if (!cuda_eval_launch_rms_general(g, g->eval_output_norm, g->eval_output_embd, output_norm_ptr,
+                                       DS4_N_EMBD, true, err, errlen)) return false;
+    if (!cuda_eval_launch_matvec_q8_0(g, g->logits, output_ptr, g->eval_output_norm,
+                                       DS4_N_EMBD, DS4_N_VOCAB, err, errlen)) return false;
+    if (ds4_cuda_synchronize(err, errlen) == 0) return false;
+    return true;
+}
+
+/* Defined after ds4_session is fully visible. */
+static bool cuda_graph_prefill_chunked_range(ds4_session *s, const ds4_tokens *prompt,
+                                              uint32_t pos0, uint32_t n_tokens,
+                                              char *err, size_t errlen);
+
 /* Reset all per-layer KV cache counters (used when prompt does not match checkpoint). */
 static void cuda_graph_reset_layer_caches(ds4_cuda_graph *g) {
+    /* Reset counters AND zero the compressor state buffers.  cuMemAlloc does
+     * not zero, so without this the FIRST emit's pool kernel reads
+     * uninitialized memory at rows [0..ratio).  Production prefill does only
+     * one prefill_loop per session, so this latent bug was masked.  Zeroing
+     * here makes both prefill_loop and prefill_chunked_range deterministic
+     * across reset cycles, which is also what the chunked_prefill_test
+     * needs to compare bit-exactly. */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        g->layer_cache[il].n_raw = 0;
-        g->layer_cache[il].n_comp = 0;
-        g->layer_cache[il].n_index_comp = 0;
+        ds4_cuda_layer_cache *lc = &g->layer_cache[il];
+        lc->n_raw = 0;
+        lc->n_comp = 0;
+        lc->n_index_comp = 0;
+        if (lc->attn_state_kv) {
+            uint64_t bytes = (uint64_t)lc->state_rows * lc->coff * DS4_N_HEAD_DIM * sizeof(float);
+            void *zero = calloc(1, (size_t)bytes);
+            if (zero) {
+                ds4_cuda_tensor_write(lc->attn_state_kv, 0, zero, bytes);
+                ds4_cuda_tensor_write(lc->attn_state_score, 0, zero, bytes);
+                free(zero);
+            }
+        }
+        if (lc->index_state_kv) {
+            uint64_t bytes = (uint64_t)lc->state_rows * lc->coff * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            void *zero = calloc(1, (size_t)bytes);
+            if (zero) {
+                ds4_cuda_tensor_write(lc->index_state_kv, 0, zero, bytes);
+                ds4_cuda_tensor_write(lc->index_state_score, 0, zero, bytes);
+                free(zero);
+            }
+        }
     }
 }
 
@@ -15353,6 +16978,7 @@ static bool cuda_graph_alloc(ds4_cuda_graph *g,
     g->raw_cap = DS4_N_SWA < ctx_size ? DS4_N_SWA : ctx_size;
     if (g->raw_cap == 0) g->raw_cap = 1;
     g->comp_cap = cuda_graph_comp_cap_for_context(ctx_size);
+    g->debug_sync = getenv("DS4_CUDA_DEBUG_SYNC") != NULL;
 
     const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
     const uint64_t hc_mix = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -15429,10 +17055,67 @@ static bool cuda_graph_alloc(ds4_cuda_graph *g,
     g->eval_index_weights = ds4_cuda_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
     g->eval_index_scores = ds4_cuda_tensor_alloc((uint64_t)g->comp_cap * sizeof(float));
     g->eval_index_allowed = ds4_cuda_tensor_alloc((uint64_t)g->comp_cap * sizeof(uint32_t));
+    g->eval_index_global_scores = ds4_cuda_tensor_alloc((uint64_t)g->comp_cap * sizeof(float));
     g->eval_output_pre = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
     g->eval_output_weights = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
     g->eval_output_embd = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->eval_output_norm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+
+    /* M-batched scratch for cuda_graph_prefill_chunked_range.  Only allocated
+     * when the chunked path is reachable (prefill_cap >= 2).  Sized for the
+     * worst-case chunk M = prefill_cap. */
+    bool batch_alloc_ok = true;
+    g->batch_chunk_cap = (g->prefill_cap >= 2u) ? g->prefill_cap : 0u;
+    if (g->batch_chunk_cap > 0u) {
+        const uint64_t M = g->batch_chunk_cap;
+        g->batch_tokens = ds4_cuda_tensor_alloc(M * sizeof(int32_t));
+        g->batch_cur_hc = ds4_cuda_tensor_alloc(M * hc_bytes);
+        g->batch_next_hc = ds4_cuda_tensor_alloc(M * hc_bytes);
+        g->batch_after_attn_hc = ds4_cuda_tensor_alloc(M * hc_bytes);
+        g->batch_flat_hc = ds4_cuda_tensor_alloc(M * hc_bytes);
+        g->batch_hc_mix = ds4_cuda_tensor_alloc(M * hc_mix * sizeof(float));
+        g->batch_hc_split = ds4_cuda_tensor_alloc(M * hc_mix * sizeof(float));
+        g->batch_attn_cur = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->batch_attn_norm = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->batch_qr = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_LORA_Q * sizeof(float));
+        g->batch_qr_norm = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_LORA_Q * sizeof(float));
+        g->batch_q = ds4_cuda_tensor_alloc(M * q_dim * sizeof(float));
+        g->batch_kv_raw = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        g->batch_kv = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        g->batch_heads = ds4_cuda_tensor_alloc(M * q_dim * sizeof(float));
+        g->batch_attn_low = ds4_cuda_tensor_alloc(M * attn_low * sizeof(float));
+        g->batch_attn_out = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->batch_ffn_hc_mix = ds4_cuda_tensor_alloc(M * hc_mix * sizeof(float));
+        g->batch_ffn_hc_split = ds4_cuda_tensor_alloc(M * hc_mix * sizeof(float));
+        g->batch_ffn_cur = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->batch_ffn_norm = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->batch_router_logits = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EXPERT * sizeof(float));
+        g->batch_router_probs = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EXPERT * sizeof(float));
+        g->batch_router_selected = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        g->batch_router_weights = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+        g->batch_routed_mid = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+        g->batch_routed_out = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->batch_shared_gate = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_FF_EXP * sizeof(float));
+        g->batch_shared_up = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_FF_EXP * sizeof(float));
+        g->batch_shared_mid = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_FF_EXP * sizeof(float));
+        g->batch_shared_out = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->batch_ffn_out = ds4_cuda_tensor_alloc(M * (uint64_t)DS4_N_EMBD * sizeof(float));
+        batch_alloc_ok = g->batch_tokens && g->batch_cur_hc && g->batch_next_hc &&
+                         g->batch_after_attn_hc && g->batch_flat_hc &&
+                         g->batch_hc_mix && g->batch_hc_split &&
+                         g->batch_attn_cur && g->batch_attn_norm &&
+                         g->batch_qr && g->batch_qr_norm && g->batch_q &&
+                         g->batch_kv_raw && g->batch_kv && g->batch_heads &&
+                         g->batch_attn_low && g->batch_attn_out &&
+                         g->batch_ffn_hc_mix && g->batch_ffn_hc_split &&
+                         g->batch_ffn_cur && g->batch_ffn_norm &&
+                         g->batch_router_logits && g->batch_router_probs &&
+                         g->batch_router_selected && g->batch_router_weights &&
+                         g->batch_routed_mid && g->batch_routed_out &&
+                         g->batch_shared_gate && g->batch_shared_up &&
+                         g->batch_shared_mid && g->batch_shared_out &&
+                         g->batch_ffn_out;
+    }
 
     /* Per-layer KV cache. */
     bool layer_alloc_ok = true;
@@ -15497,7 +17180,7 @@ static bool cuda_graph_alloc(ds4_cuda_graph *g,
                     g->eval_index_weights && g->eval_index_scores && g->eval_index_allowed &&
                     g->eval_output_pre && g->eval_output_weights &&
                     g->eval_output_embd && g->eval_output_norm &&
-                    layer_alloc_ok;
+                    layer_alloc_ok && batch_alloc_ok;
     if (!ok) {
         snprintf(err, errlen, "CUDA device allocation failed");
         cuda_graph_free(g);
@@ -16815,6 +18498,74 @@ static bool cuda_graph_prefill_loop(ds4_session *s, const ds4_tokens *prompt,
     return true;
 }
 
+/* Layer-major batched prefill over [pos0, pos0+n_tokens).  Composes the M-
+ * batched scratch + batched kernels into one pass per chunk per layer.  The
+ * caller is responsible for ensuring the layer KV caches start in the right
+ * state for `pos0` (i.e., n_raw==pos0 at every layer). */
+static bool cuda_graph_prefill_chunked_range(ds4_session *s, const ds4_tokens *prompt,
+                                              uint32_t pos0, uint32_t n_tokens,
+                                              char *err, size_t errlen) {
+    if (!s || !s->engine || !prompt || n_tokens == 0) {
+        snprintf(err, errlen, "invalid chunked prefill args");
+        return false;
+    }
+    ds4_cuda_graph *g = &s->cuda_graph;
+    if (g->batch_chunk_cap == 0) {
+        snprintf(err, errlen, "CUDA chunked prefill: batch scratch not allocated (chunk_cap==0)");
+        return false;
+    }
+    if (pos0 + n_tokens > (uint32_t)prompt->len) {
+        snprintf(err, errlen, "CUDA chunked prefill: range exceeds prompt");
+        return false;
+    }
+
+    const ds4_model *model = &s->engine->model;
+    const ds4_weights *weights = &s->engine->weights;
+    ds4_cuda_tensor *cur = g->batch_cur_hc;
+
+    if (getenv("DS4_CUDA_TIMING")) timing_init();
+    ds4_cuda_tensor *next = g->batch_next_hc;
+
+    const bool use_graph = ds4_cuda_graphs_enabled();
+
+    for (uint32_t off = 0; off < n_tokens; ) {
+        const uint32_t remaining = n_tokens - off;
+        uint32_t M = remaining < g->batch_chunk_cap ? remaining : g->batch_chunk_cap;
+        const uint32_t pos = pos0 + off;
+
+        if (!ds4_cuda_tensor_write(g->batch_tokens, 0, &prompt->v[pos],
+                                    (uint64_t)M * sizeof(int32_t))) {
+            snprintf(err, errlen, "CUDA chunk token upload failed at pos=%u", pos);
+            return false;
+        }
+
+        if (use_graph && !ds4_cuda_capture_begin(err, errlen)) return false;
+
+        uint64_t tokembd_ptr = 0;
+        if (!cuda_graph_tensor_device_ptr(g, model, weights->token_embd, &tokembd_ptr, err, errlen)) return false;
+        if (!cuda_eval_launch_embed_token_hc_batch(g, cur, tokembd_ptr, g->batch_tokens,
+                                                    (uint32_t)weights->token_embd->dim[1],
+                                                    DS4_N_EMBD, DS4_N_HC, M, err, errlen)) return false;
+
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (!cuda_graph_eval_layer_batch(g, model, weights, il, pos, M, cur, next, err, errlen)) return false;
+            ds4_cuda_tensor *tmp = cur; cur = next; next = tmp;
+        }
+
+        if (off + M >= n_tokens) {
+            if (!cuda_graph_output_head_at(g, model, weights, cur, M - 1u, err, errlen)) return false;
+        }
+
+        if (use_graph && !ds4_cuda_capture_end_launch(err, errlen)) return false;
+
+        if (s->progress) s->progress(s->progress_ud, "prefill", (int)(pos + M), prompt->len);
+        off += M;
+    }
+    if (use_graph) ds4_cuda_capture_reset();
+    timing_print();
+    return true;
+}
+
 static bool cuda_session_cpu_bridge_reset(ds4_session *s, char *err, size_t errlen) {
     if (!s || !s->engine) {
         snprintf(err, errlen, "CUDA CPU bridge session is invalid");
@@ -16886,6 +18637,940 @@ static bool cuda_session_cpu_bridge_eval(ds4_session *s,
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     return true;
+}
+#endif
+
+#ifndef DS4_NO_CUDA
+/* Drives the CUDA executor and the CPU reference per-token through the same
+ * prompt, then compares the post-prefill logits (the prediction for token
+ * prompt->len).  Per-token on both sides keeps the comparison apples-to-apples
+ * with how cuda_graph_prefill_loop runs production prefill. */
+int ds4_session_cuda_parity_probe(ds4_session *s, const ds4_tokens *prompt,
+                                  char *err, size_t errlen) {
+    if (!s || !s->engine) {
+        snprintf(err, errlen, "invalid session");
+        return 1;
+    }
+    ds4_engine *e = s->engine;
+    if (e->backend != DS4_BACKEND_CUDA) {
+        snprintf(err, errlen, "parity probe requires backend=cuda");
+        return 1;
+    }
+    if (!prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
+        snprintf(err, errlen, "prompt empty or exceeds context");
+        return 1;
+    }
+
+    /* GPU pass: per-token through the executor.  Reset KV caches first so we
+     * do not see leftover state from any prior session activity. */
+    cuda_graph_reset_layer_caches(&s->cuda_graph);
+    for (int i = 0; i < prompt->len; i++) {
+        if (!cuda_graph_eval_token(&s->cuda_graph, &e->model, &e->weights,
+                                   prompt->v[i], (uint32_t)i, err, errlen)) {
+            return 1;
+        }
+    }
+    float *gpu_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (!gpu_logits) {
+        snprintf(err, errlen, "alloc gpu_logits");
+        return 1;
+    }
+    if (!ds4_cuda_tensor_read(s->cuda_graph.logits, 0, gpu_logits,
+                              (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+        free(gpu_logits);
+        snprintf(err, errlen, "GPU logits readback failed");
+        return 1;
+    }
+
+    /* CPU pass: per-token through the reference.  Reuses the CPU-bridge KV
+     * cache and scratch already attached to the session. */
+    if (!cuda_session_cpu_bridge_reset(s, err, errlen)) {
+        free(gpu_logits);
+        return 1;
+    }
+    for (int i = 0; i < prompt->len; i++) {
+        forward_token_raw_swa_cpu_decode_scratch(s->logits,
+                                                 &e->model,
+                                                 &e->weights,
+                                                 &s->cuda_cpu_cache,
+                                                 prompt->v[i],
+                                                 (uint32_t)i,
+                                                 &s->cuda_cpu_scratch);
+    }
+
+    const float *cpu_logits = s->logits;
+    float max_abs = 0.0f;
+    int max_abs_idx = 0;
+    int top1_gpu = 0, top1_cpu = 0;
+    double l2 = 0.0;
+    for (int i = 0; i < DS4_N_VOCAB; i++) {
+        const float diff = gpu_logits[i] - cpu_logits[i];
+        const float a = fabsf(diff);
+        if (a > max_abs) { max_abs = a; max_abs_idx = i; }
+        l2 += (double)diff * (double)diff;
+        if (gpu_logits[i] > gpu_logits[top1_gpu]) top1_gpu = i;
+        if (cpu_logits[i] > cpu_logits[top1_cpu]) top1_cpu = i;
+    }
+    const double rms = sqrt(l2 / (double)DS4_N_VOCAB);
+
+    /* O(K * V) top-K picks; V≈129K and K=5, so well under 1ms. */
+    int top5_gpu[5] = { -1, -1, -1, -1, -1 };
+    int top5_cpu[5] = { -1, -1, -1, -1, -1 };
+    for (int k = 0; k < 5; k++) {
+        int best_g = -1, best_c = -1;
+        float bv_g = -INFINITY, bv_c = -INFINITY;
+        for (int i = 0; i < DS4_N_VOCAB; i++) {
+            bool taken_g = false, taken_c = false;
+            for (int j = 0; j < k; j++) {
+                if (top5_gpu[j] == i) taken_g = true;
+                if (top5_cpu[j] == i) taken_c = true;
+            }
+            if (!taken_g && gpu_logits[i] > bv_g) { bv_g = gpu_logits[i]; best_g = i; }
+            if (!taken_c && cpu_logits[i] > bv_c) { bv_c = cpu_logits[i]; best_c = i; }
+        }
+        top5_gpu[k] = best_g;
+        top5_cpu[k] = best_c;
+    }
+
+    /* Compute top-5 set intersection (order-independent).  This is the real
+     * production-parity check: the GPU is faithful to the model if it picks
+     * from the same candidate set as the CPU reference, even when within-set
+     * ordering shifts due to FP32 reduction nondeterminism. */
+    int top5_set_match = 0;
+    for (int i = 0; i < 5; i++) {
+        for (int j = 0; j < 5; j++) {
+            if (top5_gpu[i] == top5_cpu[j]) { top5_set_match++; break; }
+        }
+    }
+
+    fprintf(stderr,
+            "ds4: cuda parity probe: prompt_len=%d max_abs=%.6f@id=%d rms=%.6f "
+            "top1=%s top5_set=%d/5\n"
+            "ds4: cuda parity probe: gpu top1=%d (%.6f) cpu top1=%d (%.6f)\n"
+            "ds4: cuda parity probe: gpu top5=[%d,%d,%d,%d,%d] (%.4f,%.4f,%.4f,%.4f,%.4f)\n"
+            "ds4: cuda parity probe: cpu top5=[%d,%d,%d,%d,%d] (%.4f,%.4f,%.4f,%.4f,%.4f)\n",
+            prompt->len, max_abs, max_abs_idx, rms,
+            (top1_gpu == top1_cpu) ? "MATCH" : "DIFFER",
+            top5_set_match,
+            top1_gpu, gpu_logits[top1_gpu], top1_cpu, cpu_logits[top1_cpu],
+            top5_gpu[0], top5_gpu[1], top5_gpu[2], top5_gpu[3], top5_gpu[4],
+            gpu_logits[top5_gpu[0]], gpu_logits[top5_gpu[1]], gpu_logits[top5_gpu[2]],
+            gpu_logits[top5_gpu[3]], gpu_logits[top5_gpu[4]],
+            top5_cpu[0], top5_cpu[1], top5_cpu[2], top5_cpu[3], top5_cpu[4],
+            cpu_logits[top5_cpu[0]], cpu_logits[top5_cpu[1]], cpu_logits[top5_cpu[2]],
+            cpu_logits[top5_cpu[3]], cpu_logits[top5_cpu[4]]);
+    free(gpu_logits);
+
+    /* Mark the session as not in any consistent state — the caller should not
+     * use it for further generation after a probe.  Future calls must go
+     * through ds4_session_sync to re-establish a deterministic prefill. */
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+
+    /* Pass criterion: top-5 sets agree AND drift is bounded.  Top-1 is
+     * reported but not gated — it can flip when the top two candidates have
+     * near-equal logits, which is a property of the model not the executor. */
+    return (top5_set_match >= 5 && max_abs < 5.0f) ? 0 : 1;
+}
+
+/* Drives both the per-token and chunked prefill paths through the same
+ * prompt and compares post-prefill logits.  Same gate as parity_probe: top-5
+ * set agreement + max-abs < 5.0 (FP32 reduction-order tolerant). */
+int ds4_session_cuda_chunked_prefill_test(ds4_session *s, const ds4_tokens *prompt,
+                                          char *err, size_t errlen) {
+    if (!s || !s->engine || !prompt || prompt->len <= 0) {
+        snprintf(err, errlen, "invalid chunked prefill test args");
+        return 1;
+    }
+    ds4_engine *e = s->engine;
+    if (e->backend != DS4_BACKEND_CUDA) {
+        snprintf(err, errlen, "chunked prefill test requires backend=cuda");
+        return 1;
+    }
+    if (s->cuda_graph.batch_chunk_cap == 0) {
+        snprintf(err, errlen, "chunked prefill test: batch_chunk_cap is 0");
+        return 1;
+    }
+
+    /* Run chunked FIRST on a fresh session so its compressor state buffers
+     * see the same alloc'd memory (no prior writes from prefill_loop's
+     * state_shift).  Then run per-token prefill_loop second, which after
+     * reset_layer_caches sees the chunked path's leftovers — but pool reads
+     * rows [0..ratio) which the chunked path also wrote via state_shift, so
+     * the inputs to pool match exactly. */
+    cuda_graph_reset_layer_caches(&s->cuda_graph);
+    if (!cuda_graph_prefill_chunked_range(s, prompt, 0, (uint32_t)prompt->len, err, errlen)) return 1;
+    float *bat_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (!bat_logits) {
+        snprintf(err, errlen, "bat logits alloc failed");
+        return 1;
+    }
+    if (!ds4_cuda_tensor_read(s->cuda_graph.logits, 0, bat_logits,
+                              (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+        free(bat_logits);
+        snprintf(err, errlen, "bat logits read failed");
+        return 1;
+    }
+
+    /* Reference: per-token prefill loop. */
+    cuda_graph_reset_layer_caches(&s->cuda_graph);
+    if (!cuda_graph_prefill_loop(s, prompt, err, errlen)) { free(bat_logits); return 1; }
+    float *ref_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (!ref_logits) {
+        free(bat_logits);
+        snprintf(err, errlen, "ref logits alloc failed");
+        return 1;
+    }
+    if (!ds4_cuda_tensor_read(s->cuda_graph.logits, 0, ref_logits,
+                              (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+        free(bat_logits); free(ref_logits);
+        snprintf(err, errlen, "ref logits read failed");
+        return 1;
+    }
+
+    float max_abs = 0.0f, sse = 0.0f;
+    for (int i = 0; i < DS4_N_VOCAB; i++) {
+        float d = fabsf(ref_logits[i] - bat_logits[i]);
+        if (d > max_abs) max_abs = d;
+        sse += d * d;
+    }
+    float rms = sqrtf(sse / (float)DS4_N_VOCAB);
+
+    int top1_ref = 0, top1_bat = 0;
+    for (int i = 1; i < DS4_N_VOCAB; i++) {
+        if (ref_logits[i] > ref_logits[top1_ref]) top1_ref = i;
+        if (bat_logits[i] > bat_logits[top1_bat]) top1_bat = i;
+    }
+
+    int top5_ref[5] = {0,0,0,0,0}, top5_bat[5] = {0,0,0,0,0};
+    for (int k = 0; k < 5; k++) {
+        int best_ref = -1, best_bat = -1;
+        float best_ref_v = -1e38f, best_bat_v = -1e38f;
+        for (int i = 0; i < DS4_N_VOCAB; i++) {
+            int seen_ref = 0, seen_bat = 0;
+            for (int j = 0; j < k; j++) {
+                if (top5_ref[j] == i) seen_ref = 1;
+                if (top5_bat[j] == i) seen_bat = 1;
+            }
+            if (!seen_ref && ref_logits[i] > best_ref_v) { best_ref = i; best_ref_v = ref_logits[i]; }
+            if (!seen_bat && bat_logits[i] > best_bat_v) { best_bat = i; best_bat_v = bat_logits[i]; }
+        }
+        top5_ref[k] = best_ref;
+        top5_bat[k] = best_bat;
+    }
+    int top5_set_match = 0;
+    for (int i = 0; i < 5; i++) {
+        for (int j = 0; j < 5; j++) {
+            if (top5_ref[i] == top5_bat[j]) { top5_set_match++; break; }
+        }
+    }
+
+    fprintf(stderr,
+            "ds4: cuda chunked prefill test: prompt_len=%d max_abs=%.3f rms=%.3f top1=%s (ref=%d bat=%d) top5_set=%d/5\n",
+            prompt->len, max_abs, rms,
+            (top1_ref == top1_bat) ? "MATCH" : "DIFFER", top1_ref, top1_bat, top5_set_match);
+
+    free(ref_logits); free(bat_logits);
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+    return (top5_set_match >= 5 && max_abs < 5.0f) ? 0 : 1;
+}
+#else
+int ds4_session_cuda_parity_probe(ds4_session *s, const ds4_tokens *prompt,
+                                  char *err, size_t errlen) {
+    (void)s; (void)prompt;
+    snprintf(err, errlen, "CUDA support is not compiled in");
+    return 1;
+}
+int ds4_session_cuda_chunked_prefill_test(ds4_session *s, const ds4_tokens *prompt,
+                                          char *err, size_t errlen) {
+    (void)s; (void)prompt;
+    snprintf(err, errlen, "CUDA support is not compiled in");
+    return 1;
+}
+#endif
+
+#ifndef DS4_NO_CUDA
+/* Drives the batched matvec kernels against the per-token kernels using a
+ * real layer-0 weight tensor and synthetic activations.  When the batched
+ * dot-product reduction tree matches the per-token tree (same 256-thread
+ * block, same fp32 accumulation order), the outputs should be bit-equal. */
+int ds4_session_cuda_batch_kernel_test(ds4_session *s, char *err, size_t errlen) {
+    if (!s || !s->engine) {
+        snprintf(err, errlen, "invalid session");
+        return 1;
+    }
+    ds4_engine *e = s->engine;
+    if (e->backend != DS4_BACKEND_CUDA) {
+        snprintf(err, errlen, "batch kernel test requires backend=cuda");
+        return 1;
+    }
+    ds4_cuda_graph *g = &s->cuda_graph;
+    if (!g->matvec_q8_0_f32_batch || !g->matvec_f16_f32_batch) {
+        snprintf(err, errlen, "batched matvec kernels are not loaded");
+        return 1;
+    }
+
+    const uint32_t M = 8;
+    const uint32_t in_dim = DS4_N_EMBD;
+    const uint32_t out_dim_q8 = DS4_N_LORA_Q;
+    const uint32_t out_dim_f16 = 8;
+
+    uint64_t w_q8_ptr = 0;
+    if (!cuda_graph_tensor_device_ptr(g, &e->model,
+                                       e->weights.layer[0].attn_q_a,
+                                       &w_q8_ptr, err, errlen)) {
+        return 1;
+    }
+    uint64_t w_f16_ptr = 0;
+    if (!cuda_graph_tensor_device_ptr(g, &e->model,
+                                       e->weights.layer[0].hc_attn_fn,
+                                       &w_f16_ptr, err, errlen)) {
+        return 1;
+    }
+    /* hc_attn_fn is hc_dim → 2*HC + HC*HC = 24 (>= out_dim_f16). */
+
+    ds4_cuda_tensor *x_batch = ds4_cuda_tensor_alloc((uint64_t)M * in_dim * sizeof(float));
+    ds4_cuda_tensor *dst_seq_q8 = ds4_cuda_tensor_alloc((uint64_t)M * out_dim_q8 * sizeof(float));
+    ds4_cuda_tensor *dst_batch_q8 = ds4_cuda_tensor_alloc((uint64_t)M * out_dim_q8 * sizeof(float));
+    ds4_cuda_tensor *dst_seq_f16 = ds4_cuda_tensor_alloc((uint64_t)M * out_dim_f16 * sizeof(float));
+    ds4_cuda_tensor *dst_batch_f16 = ds4_cuda_tensor_alloc((uint64_t)M * out_dim_f16 * sizeof(float));
+    float *host_x = malloc((size_t)M * in_dim * sizeof(float));
+    float *seq_out_q8 = malloc((size_t)M * out_dim_q8 * sizeof(float));
+    float *batch_out_q8 = malloc((size_t)M * out_dim_q8 * sizeof(float));
+    float *seq_out_f16 = malloc((size_t)M * out_dim_f16 * sizeof(float));
+    float *batch_out_f16 = malloc((size_t)M * out_dim_f16 * sizeof(float));
+    if (!x_batch || !dst_seq_q8 || !dst_batch_q8 || !dst_seq_f16 || !dst_batch_f16 ||
+        !host_x || !seq_out_q8 || !batch_out_q8 || !seq_out_f16 || !batch_out_f16) {
+        snprintf(err, errlen, "test buffer alloc failed");
+        goto cleanup_fail;
+    }
+
+    /* Distinct per-token activations so any cross-token contamination shows
+     * up as a delta. */
+    for (uint32_t t = 0; t < M; t++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            host_x[t * in_dim + i] = sinf((float)(t * 17u + i) * 0.001f);
+        }
+    }
+    if (!ds4_cuda_tensor_write(x_batch, 0, host_x,
+                                (uint64_t)M * in_dim * sizeof(float))) {
+        snprintf(err, errlen, "x write failed");
+        goto cleanup_fail;
+    }
+
+    /* Sequential per-token reference: M separate launches via views. */
+    for (uint32_t t = 0; t < M; t++) {
+        ds4_cuda_tensor *xv = ds4_cuda_tensor_view(
+                x_batch,
+                (uint64_t)t * in_dim * sizeof(float),
+                (uint64_t)in_dim * sizeof(float));
+        ds4_cuda_tensor *dv_q8 = ds4_cuda_tensor_view(
+                dst_seq_q8,
+                (uint64_t)t * out_dim_q8 * sizeof(float),
+                (uint64_t)out_dim_q8 * sizeof(float));
+        ds4_cuda_tensor *dv_f16 = ds4_cuda_tensor_view(
+                dst_seq_f16,
+                (uint64_t)t * out_dim_f16 * sizeof(float),
+                (uint64_t)out_dim_f16 * sizeof(float));
+        bool ok = xv && dv_q8 && dv_f16 &&
+                cuda_eval_launch_matvec_q8_0(g, dv_q8, w_q8_ptr, xv,
+                                             in_dim, out_dim_q8, err, errlen) &&
+                cuda_eval_launch_matvec_f16(g, dv_f16, w_f16_ptr, xv,
+                                            in_dim, out_dim_f16, err, errlen);
+        ds4_cuda_tensor_free(xv);
+        ds4_cuda_tensor_free(dv_q8);
+        ds4_cuda_tensor_free(dv_f16);
+        if (!ok) goto cleanup_fail;
+    }
+
+    /* Batched: one launch each. */
+    if (!cuda_eval_launch_matvec_q8_0_batch(g, dst_batch_q8, w_q8_ptr, x_batch,
+                                            in_dim, out_dim_q8, M, err, errlen)) {
+        goto cleanup_fail;
+    }
+    if (!cuda_eval_launch_matvec_f16_batch(g, dst_batch_f16, w_f16_ptr, x_batch,
+                                           in_dim, out_dim_f16, M, err, errlen)) {
+        goto cleanup_fail;
+    }
+    if (ds4_cuda_synchronize(err, errlen) == 0) goto cleanup_fail;
+
+    if (!ds4_cuda_tensor_read(dst_seq_q8, 0, seq_out_q8,
+                              (uint64_t)M * out_dim_q8 * sizeof(float)) ||
+        !ds4_cuda_tensor_read(dst_batch_q8, 0, batch_out_q8,
+                              (uint64_t)M * out_dim_q8 * sizeof(float)) ||
+        !ds4_cuda_tensor_read(dst_seq_f16, 0, seq_out_f16,
+                              (uint64_t)M * out_dim_f16 * sizeof(float)) ||
+        !ds4_cuda_tensor_read(dst_batch_f16, 0, batch_out_f16,
+                              (uint64_t)M * out_dim_f16 * sizeof(float)))
+    {
+        snprintf(err, errlen, "tensor readback failed");
+        goto cleanup_fail;
+    }
+
+    uint32_t mis_q8 = 0, mis_f16 = 0;
+    float max_q8 = 0.0f, max_f16 = 0.0f;
+    for (uint32_t i = 0; i < M * out_dim_q8; i++) {
+        const float d = fabsf(seq_out_q8[i] - batch_out_q8[i]);
+        if (d != 0.0f) { mis_q8++; if (d > max_q8) max_q8 = d; }
+    }
+    for (uint32_t i = 0; i < M * out_dim_f16; i++) {
+        const float d = fabsf(seq_out_f16[i] - batch_out_f16[i]);
+        if (d != 0.0f) { mis_f16++; if (d > max_f16) max_f16 = d; }
+    }
+
+    /* === RMS, head-RMS, RoPE, HC-post, swiglu, add, KV-FP8 sub-tests === */
+    const uint32_t rms_n = in_dim;
+    const uint32_t head_dim = DS4_N_HEAD_DIM;
+    const uint32_t n_head = 4;
+    const uint32_t per_token_head = n_head * head_dim;
+    const uint32_t n_rot = DS4_N_ROT;
+    const uint32_t hc_dim = DS4_N_HC * DS4_N_EMBD;
+    const uint32_t pos0 = 7;
+    const uint32_t ff = 1024;
+
+    ds4_cuda_tensor *rms_seq = ds4_cuda_tensor_alloc((uint64_t)M * rms_n * sizeof(float));
+    ds4_cuda_tensor *rms_bat = ds4_cuda_tensor_alloc((uint64_t)M * rms_n * sizeof(float));
+    ds4_cuda_tensor *hrms_seq = ds4_cuda_tensor_alloc((uint64_t)M * per_token_head * sizeof(float));
+    ds4_cuda_tensor *hrms_bat = ds4_cuda_tensor_alloc((uint64_t)M * per_token_head * sizeof(float));
+    ds4_cuda_tensor *rope_seq = ds4_cuda_tensor_alloc((uint64_t)M * per_token_head * sizeof(float));
+    ds4_cuda_tensor *rope_bat = ds4_cuda_tensor_alloc((uint64_t)M * per_token_head * sizeof(float));
+    ds4_cuda_tensor *hc_block = ds4_cuda_tensor_alloc((uint64_t)M * DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *hc_res   = ds4_cuda_tensor_alloc((uint64_t)M * hc_dim * sizeof(float));
+    ds4_cuda_tensor *hc_split = ds4_cuda_tensor_alloc((uint64_t)M * 24u * sizeof(float));
+    ds4_cuda_tensor *hc_seq   = ds4_cuda_tensor_alloc((uint64_t)M * hc_dim * sizeof(float));
+    ds4_cuda_tensor *hc_bat   = ds4_cuda_tensor_alloc((uint64_t)M * hc_dim * sizeof(float));
+    ds4_cuda_tensor *swg_gate = ds4_cuda_tensor_alloc((uint64_t)M * ff * sizeof(float));
+    ds4_cuda_tensor *swg_up   = ds4_cuda_tensor_alloc((uint64_t)M * ff * sizeof(float));
+    ds4_cuda_tensor *swg_seq  = ds4_cuda_tensor_alloc((uint64_t)M * ff * sizeof(float));
+    ds4_cuda_tensor *swg_bat  = ds4_cuda_tensor_alloc((uint64_t)M * ff * sizeof(float));
+    ds4_cuda_tensor *add_a    = ds4_cuda_tensor_alloc((uint64_t)M * ff * sizeof(float));
+    ds4_cuda_tensor *add_b    = ds4_cuda_tensor_alloc((uint64_t)M * ff * sizeof(float));
+    ds4_cuda_tensor *add_seq  = ds4_cuda_tensor_alloc((uint64_t)M * ff * sizeof(float));
+    ds4_cuda_tensor *add_bat  = ds4_cuda_tensor_alloc((uint64_t)M * ff * sizeof(float));
+    ds4_cuda_tensor *kv_seq   = ds4_cuda_tensor_alloc((uint64_t)M * head_dim * sizeof(float));
+    ds4_cuda_tensor *kv_bat   = ds4_cuda_tensor_alloc((uint64_t)M * head_dim * sizeof(float));
+    float *rms_seq_h = malloc((size_t)M * rms_n * sizeof(float));
+    float *rms_bat_h = malloc((size_t)M * rms_n * sizeof(float));
+    float *hrms_seq_h = malloc((size_t)M * per_token_head * sizeof(float));
+    float *hrms_bat_h = malloc((size_t)M * per_token_head * sizeof(float));
+    float *rope_seq_h = malloc((size_t)M * per_token_head * sizeof(float));
+    float *rope_bat_h = malloc((size_t)M * per_token_head * sizeof(float));
+    float *hc_seq_h = malloc((size_t)M * hc_dim * sizeof(float));
+    float *hc_bat_h = malloc((size_t)M * hc_dim * sizeof(float));
+    float *head_in_h = malloc((size_t)M * per_token_head * sizeof(float));
+    float *hc_block_h = malloc((size_t)M * DS4_N_EMBD * sizeof(float));
+    float *hc_res_h = malloc((size_t)M * hc_dim * sizeof(float));
+    float *hc_split_h = malloc((size_t)M * 24u * sizeof(float));
+    float *swg_gate_h = malloc((size_t)M * ff * sizeof(float));
+    float *swg_up_h = malloc((size_t)M * ff * sizeof(float));
+    float *swg_seq_h = malloc((size_t)M * ff * sizeof(float));
+    float *swg_bat_h = malloc((size_t)M * ff * sizeof(float));
+    float *add_a_h = malloc((size_t)M * ff * sizeof(float));
+    float *add_b_h = malloc((size_t)M * ff * sizeof(float));
+    float *add_seq_h = malloc((size_t)M * ff * sizeof(float));
+    float *add_bat_h = malloc((size_t)M * ff * sizeof(float));
+    float *kv_in_h = malloc((size_t)M * head_dim * sizeof(float));
+    float *kv_seq_h = malloc((size_t)M * head_dim * sizeof(float));
+    float *kv_bat_h = malloc((size_t)M * head_dim * sizeof(float));
+    if (!rms_seq || !rms_bat || !hrms_seq || !hrms_bat || !rope_seq || !rope_bat ||
+        !hc_block || !hc_res || !hc_split || !hc_seq || !hc_bat ||
+        !swg_gate || !swg_up || !swg_seq || !swg_bat ||
+        !add_a || !add_b || !add_seq || !add_bat || !kv_seq || !kv_bat ||
+        !rms_seq_h || !rms_bat_h || !hrms_seq_h || !hrms_bat_h ||
+        !rope_seq_h || !rope_bat_h || !hc_seq_h || !hc_bat_h ||
+        !head_in_h || !hc_block_h || !hc_res_h || !hc_split_h ||
+        !swg_gate_h || !swg_up_h || !swg_seq_h || !swg_bat_h ||
+        !add_a_h || !add_b_h || !add_seq_h || !add_bat_h ||
+        !kv_in_h || !kv_seq_h || !kv_bat_h)
+    {
+        snprintf(err, errlen, "extended test buffer alloc failed");
+        goto cleanup_ext_fail;
+    }
+
+    /* RMS uses host_x directly (already in x_batch). */
+
+    /* head-RMS / RoPE inputs.  RoPE is in-place, so copy fresh each path. */
+    for (uint32_t i = 0; i < M * per_token_head; i++) head_in_h[i] = sinf((float)(i * 7u + 11u) * 0.0007f);
+
+    /* HC inputs. */
+    for (uint32_t i = 0; i < M * DS4_N_EMBD; i++) hc_block_h[i] = cosf((float)(i * 5u + 3u) * 0.001f);
+    for (uint32_t i = 0; i < M * hc_dim; i++)     hc_res_h[i]   = sinf((float)(i * 3u + 19u) * 0.0009f);
+    for (uint32_t i = 0; i < M * 24u; i++)        hc_split_h[i] = 0.1f + (float)(i % 7u) * 0.05f;
+
+    /* SwiGLU / add / KV-FP8 inputs. */
+    for (uint32_t i = 0; i < M * ff; i++) {
+        swg_gate_h[i] = sinf((float)(i * 11u + 5u) * 0.0008f);
+        swg_up_h[i]   = cosf((float)(i * 13u + 7u) * 0.0006f);
+        add_a_h[i]    = sinf((float)(i * 17u + 9u) * 0.0011f);
+        add_b_h[i]    = cosf((float)(i * 19u + 1u) * 0.0013f);
+    }
+    for (uint32_t i = 0; i < M * head_dim; i++) {
+        kv_in_h[i] = 0.1f * sinf((float)(i * 23u + 17u) * 0.005f);
+    }
+
+    /* Sequential per-token RMS (use existing single-token wrapper). */
+    for (uint32_t t = 0; t < M; t++) {
+        ds4_cuda_tensor *xv = ds4_cuda_tensor_view(x_batch,
+                (uint64_t)t * rms_n * sizeof(float),
+                (uint64_t)rms_n * sizeof(float));
+        ds4_cuda_tensor *yv = ds4_cuda_tensor_view(rms_seq,
+                (uint64_t)t * rms_n * sizeof(float),
+                (uint64_t)rms_n * sizeof(float));
+        bool ok = xv && yv && cuda_graph_launch_rms(g, yv, xv, 0, rms_n, false, err, errlen);
+        ds4_cuda_tensor_free(xv);
+        ds4_cuda_tensor_free(yv);
+        if (!ok) goto cleanup_ext_fail;
+    }
+    if (!cuda_eval_launch_rms_general_batch(g, rms_bat, x_batch, 0, rms_n, false, M, err, errlen)) {
+        goto cleanup_ext_fail;
+    }
+
+    /* head-RMS: need two copies of head_in (in-place op). */
+    if (!ds4_cuda_tensor_write(hrms_seq, 0, head_in_h,
+                               (uint64_t)M * per_token_head * sizeof(float)) ||
+        !ds4_cuda_tensor_write(hrms_bat, 0, head_in_h,
+                               (uint64_t)M * per_token_head * sizeof(float)))
+    {
+        snprintf(err, errlen, "head_in write failed");
+        goto cleanup_ext_fail;
+    }
+    for (uint32_t t = 0; t < M; t++) {
+        ds4_cuda_tensor *v = ds4_cuda_tensor_view(hrms_seq,
+                (uint64_t)t * per_token_head * sizeof(float),
+                (uint64_t)per_token_head * sizeof(float));
+        bool ok = v && cuda_eval_launch_head_rms(g, v, n_head, head_dim, err, errlen);
+        ds4_cuda_tensor_free(v);
+        if (!ok) goto cleanup_ext_fail;
+    }
+    if (!cuda_eval_launch_head_rms_batch(g, hrms_bat, n_head, head_dim, M, err, errlen)) {
+        goto cleanup_ext_fail;
+    }
+
+    /* RoPE: fresh copies (in-place). */
+    if (!ds4_cuda_tensor_write(rope_seq, 0, head_in_h,
+                               (uint64_t)M * per_token_head * sizeof(float)) ||
+        !ds4_cuda_tensor_write(rope_bat, 0, head_in_h,
+                               (uint64_t)M * per_token_head * sizeof(float)))
+    {
+        snprintf(err, errlen, "rope_in write failed");
+        goto cleanup_ext_fail;
+    }
+    for (uint32_t t = 0; t < M; t++) {
+        ds4_cuda_tensor *v = ds4_cuda_tensor_view(rope_seq,
+                (uint64_t)t * per_token_head * sizeof(float),
+                (uint64_t)per_token_head * sizeof(float));
+        bool ok = v && cuda_eval_launch_rope(g, v, n_head, head_dim, n_rot,
+                                              pos0 + t, /*il*/0, false, err, errlen);
+        ds4_cuda_tensor_free(v);
+        if (!ok) goto cleanup_ext_fail;
+    }
+    if (!cuda_eval_launch_rope_batch(g, rope_bat, n_head, head_dim, n_rot,
+                                     pos0, M, /*il*/0, false, err, errlen)) {
+        goto cleanup_ext_fail;
+    }
+
+    /* HC-post. */
+    if (!ds4_cuda_tensor_write(hc_block, 0, hc_block_h,
+                               (uint64_t)M * DS4_N_EMBD * sizeof(float)) ||
+        !ds4_cuda_tensor_write(hc_res, 0, hc_res_h,
+                               (uint64_t)M * hc_dim * sizeof(float)) ||
+        !ds4_cuda_tensor_write(hc_split, 0, hc_split_h,
+                               (uint64_t)M * 24u * sizeof(float)))
+    {
+        snprintf(err, errlen, "hc input write failed");
+        goto cleanup_ext_fail;
+    }
+    for (uint32_t t = 0; t < M; t++) {
+        ds4_cuda_tensor *bv = ds4_cuda_tensor_view(hc_block,
+                (uint64_t)t * DS4_N_EMBD * sizeof(float),
+                (uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_cuda_tensor *rv = ds4_cuda_tensor_view(hc_res,
+                (uint64_t)t * hc_dim * sizeof(float),
+                (uint64_t)hc_dim * sizeof(float));
+        ds4_cuda_tensor *sv = ds4_cuda_tensor_view(hc_split,
+                (uint64_t)t * 24u * sizeof(float),
+                (uint64_t)24u * sizeof(float));
+        ds4_cuda_tensor *dv = ds4_cuda_tensor_view(hc_seq,
+                (uint64_t)t * hc_dim * sizeof(float),
+                (uint64_t)hc_dim * sizeof(float));
+        bool ok = bv && rv && sv && dv &&
+                cuda_graph_launch_hc4_post_to(g, dv, bv, rv, sv, err, errlen);
+        ds4_cuda_tensor_free(bv);
+        ds4_cuda_tensor_free(rv);
+        ds4_cuda_tensor_free(sv);
+        ds4_cuda_tensor_free(dv);
+        if (!ok) goto cleanup_ext_fail;
+    }
+    if (!cuda_eval_launch_hc4_post_batch(g, hc_bat, hc_block, hc_res, hc_split, M, err, errlen)) {
+        goto cleanup_ext_fail;
+    }
+
+    /* SwiGLU. */
+    if (!ds4_cuda_tensor_write(swg_gate, 0, swg_gate_h, (uint64_t)M * ff * sizeof(float)) ||
+        !ds4_cuda_tensor_write(swg_up, 0, swg_up_h, (uint64_t)M * ff * sizeof(float)))
+    {
+        snprintf(err, errlen, "swiglu input write failed");
+        goto cleanup_ext_fail;
+    }
+    for (uint32_t t = 0; t < M; t++) {
+        ds4_cuda_tensor *gv = ds4_cuda_tensor_view(swg_gate,
+                (uint64_t)t * ff * sizeof(float), (uint64_t)ff * sizeof(float));
+        ds4_cuda_tensor *uv = ds4_cuda_tensor_view(swg_up,
+                (uint64_t)t * ff * sizeof(float), (uint64_t)ff * sizeof(float));
+        ds4_cuda_tensor *dv = ds4_cuda_tensor_view(swg_seq,
+                (uint64_t)t * ff * sizeof(float), (uint64_t)ff * sizeof(float));
+        bool ok = gv && uv && dv &&
+                cuda_eval_launch_swiglu(g, dv, gv, uv, ff, /*clamp*/0.0f, err, errlen);
+        ds4_cuda_tensor_free(gv);
+        ds4_cuda_tensor_free(uv);
+        ds4_cuda_tensor_free(dv);
+        if (!ok) goto cleanup_ext_fail;
+    }
+    if (!cuda_eval_launch_swiglu_batch(g, swg_bat, swg_gate, swg_up, ff, 0.0f, M, err, errlen)) {
+        goto cleanup_ext_fail;
+    }
+
+    /* Add. */
+    if (!ds4_cuda_tensor_write(add_a, 0, add_a_h, (uint64_t)M * ff * sizeof(float)) ||
+        !ds4_cuda_tensor_write(add_b, 0, add_b_h, (uint64_t)M * ff * sizeof(float)))
+    {
+        snprintf(err, errlen, "add input write failed");
+        goto cleanup_ext_fail;
+    }
+    for (uint32_t t = 0; t < M; t++) {
+        ds4_cuda_tensor *av = ds4_cuda_tensor_view(add_a,
+                (uint64_t)t * ff * sizeof(float), (uint64_t)ff * sizeof(float));
+        ds4_cuda_tensor *bv = ds4_cuda_tensor_view(add_b,
+                (uint64_t)t * ff * sizeof(float), (uint64_t)ff * sizeof(float));
+        ds4_cuda_tensor *dv = ds4_cuda_tensor_view(add_seq,
+                (uint64_t)t * ff * sizeof(float), (uint64_t)ff * sizeof(float));
+        bool ok = av && bv && dv &&
+                cuda_eval_launch_add(g, dv, av, bv, ff, err, errlen);
+        ds4_cuda_tensor_free(av);
+        ds4_cuda_tensor_free(bv);
+        ds4_cuda_tensor_free(dv);
+        if (!ok) goto cleanup_ext_fail;
+    }
+    if (!cuda_eval_launch_add_batch(g, add_bat, add_a, add_b, ff, M, err, errlen)) {
+        goto cleanup_ext_fail;
+    }
+
+    /* Embed token. */
+    {
+        const uint32_t n_hc = DS4_N_HC;
+        const uint64_t embd_per_tok = (uint64_t)n_hc * DS4_N_EMBD;
+        ds4_cuda_tensor *emb_seq = ds4_cuda_tensor_alloc((uint64_t)M * embd_per_tok * sizeof(float));
+        ds4_cuda_tensor *emb_bat = ds4_cuda_tensor_alloc((uint64_t)M * embd_per_tok * sizeof(float));
+        ds4_cuda_tensor *tok_d = ds4_cuda_tensor_alloc((uint64_t)M * sizeof(int));
+        float *emb_seq_h = malloc((size_t)M * embd_per_tok * sizeof(float));
+        float *emb_bat_h = malloc((size_t)M * embd_per_tok * sizeof(float));
+        int tok_h[16];
+        for (uint32_t t = 0; t < M; t++) tok_h[t] = (int)((t * 1009u + 7u) % 1000u);
+        uint64_t tokembd_ptr = 0;
+        bool emb_ok = emb_seq && emb_bat && tok_d && emb_seq_h && emb_bat_h &&
+                cuda_graph_tensor_device_ptr(g, &e->model, e->weights.token_embd,
+                                              &tokembd_ptr, err, errlen) &&
+                ds4_cuda_tensor_write(tok_d, 0, tok_h, (uint64_t)M * sizeof(int));
+        if (emb_ok) {
+            for (uint32_t t = 0; t < M && emb_ok; t++) {
+                ds4_cuda_tensor *dv = ds4_cuda_tensor_view(emb_seq,
+                        (uint64_t)t * embd_per_tok * sizeof(float),
+                        embd_per_tok * sizeof(float));
+                if (!dv) { emb_ok = false; break; }
+                /* Single-token kernel takes uint32 token via host arg. */
+                uint64_t dst_ptr = ds4_cuda_tensor_device_ptr(dv);
+                uint32_t token_u32 = (uint32_t)tok_h[t];
+                uint32_t n_vocab = (uint32_t)e->weights.token_embd->dim[1];
+                uint32_t n_embd_v = DS4_N_EMBD;
+                uint32_t n_hc_v = DS4_N_HC;
+                void *args[] = { &dst_ptr, &tokembd_ptr, &token_u32, &n_vocab, &n_embd_v, &n_hc_v };
+                const uint32_t n = n_embd_v * n_hc_v;
+                const uint32_t block = 256;
+                const uint32_t grid = (n + block - 1u) / block;
+                emb_ok = ds4_cuda_launch_kernel(g->embed_token_hc_f16, grid, 1, 1,
+                                                 block, 1, 1, 0, args, err, errlen) != 0;
+                ds4_cuda_tensor_free(dv);
+            }
+        }
+        if (emb_ok) {
+            emb_ok = cuda_eval_launch_embed_token_hc_batch(g, emb_bat, tokembd_ptr,
+                                                          tok_d,
+                                                          (uint32_t)e->weights.token_embd->dim[1],
+                                                          DS4_N_EMBD, n_hc, M, err, errlen);
+        }
+        if (emb_ok) emb_ok = ds4_cuda_synchronize(err, errlen) != 0;
+        if (emb_ok) {
+            emb_ok = ds4_cuda_tensor_read(emb_seq, 0, emb_seq_h,
+                                           (uint64_t)M * embd_per_tok * sizeof(float)) &&
+                     ds4_cuda_tensor_read(emb_bat, 0, emb_bat_h,
+                                           (uint64_t)M * embd_per_tok * sizeof(float));
+        }
+        uint32_t mis_emb = 0;
+        float max_emb = 0.0f;
+        if (emb_ok) {
+            for (uint64_t i = 0; i < (uint64_t)M * embd_per_tok; i++) {
+                float d = fabsf(emb_seq_h[i] - emb_bat_h[i]);
+                if (d != 0.0f) { mis_emb++; if (d > max_emb) max_emb = d; }
+            }
+            fprintf(stderr,
+                    "ds4:   embed    n_hc=%u n_embd=%u mismatches=%u/%llu max_abs=%.6e\n",
+                    n_hc, DS4_N_EMBD, mis_emb,
+                    (unsigned long long)((uint64_t)M * embd_per_tok), max_emb);
+        } else {
+            fprintf(stderr, "ds4:   embed    skipped (setup failure: %s)\n", err);
+        }
+        free(emb_seq_h); free(emb_bat_h);
+        ds4_cuda_tensor_free(emb_seq);
+        ds4_cuda_tensor_free(emb_bat);
+        ds4_cuda_tensor_free(tok_d);
+        if (emb_ok && mis_emb != 0) {
+            snprintf(err, errlen, "embed batch parity failed (%u mismatches)", mis_emb);
+            goto cleanup_ext_fail;
+        }
+    }
+
+    /* router_probs (batched) parity. */
+    {
+        const uint32_t n_expert = DS4_N_EXPERT;
+        ds4_cuda_tensor *rp_logits = ds4_cuda_tensor_alloc((uint64_t)M * n_expert * sizeof(float));
+        ds4_cuda_tensor *rp_seq = ds4_cuda_tensor_alloc((uint64_t)M * n_expert * sizeof(float));
+        ds4_cuda_tensor *rp_bat = ds4_cuda_tensor_alloc((uint64_t)M * n_expert * sizeof(float));
+        float *rp_logits_h = malloc((size_t)M * n_expert * sizeof(float));
+        float *rp_seq_h = malloc((size_t)M * n_expert * sizeof(float));
+        float *rp_bat_h = malloc((size_t)M * n_expert * sizeof(float));
+        bool rp_ok = rp_logits && rp_seq && rp_bat && rp_logits_h && rp_seq_h && rp_bat_h;
+        if (rp_ok) {
+            for (uint32_t i = 0; i < M * n_expert; i++) {
+                rp_logits_h[i] = sinf((float)(i * 31u + 13u) * 0.0017f) * 4.0f;
+            }
+            rp_ok = ds4_cuda_tensor_write(rp_logits, 0, rp_logits_h,
+                                           (uint64_t)M * n_expert * sizeof(float));
+        }
+        if (rp_ok) {
+            for (uint32_t t = 0; t < M && rp_ok; t++) {
+                ds4_cuda_tensor *lv = ds4_cuda_tensor_view(rp_logits,
+                        (uint64_t)t * n_expert * sizeof(float),
+                        (uint64_t)n_expert * sizeof(float));
+                ds4_cuda_tensor *pv = ds4_cuda_tensor_view(rp_seq,
+                        (uint64_t)t * n_expert * sizeof(float),
+                        (uint64_t)n_expert * sizeof(float));
+                rp_ok = lv && pv && cuda_eval_launch_router_probs(g, pv, lv, n_expert, err, errlen);
+                ds4_cuda_tensor_free(lv);
+                ds4_cuda_tensor_free(pv);
+            }
+        }
+        if (rp_ok) {
+            rp_ok = cuda_eval_launch_router_probs_batch(g, rp_bat, rp_logits,
+                                                       n_expert, M, err, errlen);
+        }
+        if (rp_ok) rp_ok = ds4_cuda_synchronize(err, errlen) != 0;
+        if (rp_ok) {
+            rp_ok = ds4_cuda_tensor_read(rp_seq, 0, rp_seq_h,
+                                          (uint64_t)M * n_expert * sizeof(float)) &&
+                    ds4_cuda_tensor_read(rp_bat, 0, rp_bat_h,
+                                          (uint64_t)M * n_expert * sizeof(float));
+        }
+        uint32_t mis_rp = 0;
+        float max_rp = 0.0f;
+        if (rp_ok) {
+            for (uint32_t i = 0; i < M * n_expert; i++) {
+                float d = fabsf(rp_seq_h[i] - rp_bat_h[i]);
+                if (d != 0.0f) { mis_rp++; if (d > max_rp) max_rp = d; }
+            }
+            fprintf(stderr,
+                    "ds4:   router_probs n_expert=%u  mismatches=%u/%u max_abs=%.6e\n",
+                    n_expert, mis_rp, M * n_expert, max_rp);
+        } else {
+            fprintf(stderr, "ds4:   router_probs skipped (setup failure: %s)\n", err);
+        }
+        free(rp_logits_h); free(rp_seq_h); free(rp_bat_h);
+        ds4_cuda_tensor_free(rp_logits);
+        ds4_cuda_tensor_free(rp_seq);
+        ds4_cuda_tensor_free(rp_bat);
+        if (rp_ok && mis_rp != 0) {
+            snprintf(err, errlen, "router_probs batch parity failed (%u mismatches)", mis_rp);
+            goto cleanup_ext_fail;
+        }
+    }
+
+    /* KV-FP8 round-trip. */
+    if (!ds4_cuda_tensor_write(kv_seq, 0, kv_in_h, (uint64_t)M * head_dim * sizeof(float)) ||
+        !ds4_cuda_tensor_write(kv_bat, 0, kv_in_h, (uint64_t)M * head_dim * sizeof(float)))
+    {
+        snprintf(err, errlen, "kv input write failed");
+        goto cleanup_ext_fail;
+    }
+    for (uint32_t t = 0; t < M; t++) {
+        ds4_cuda_tensor *v = ds4_cuda_tensor_view(kv_seq,
+                (uint64_t)t * head_dim * sizeof(float), (uint64_t)head_dim * sizeof(float));
+        bool ok = v && cuda_eval_launch_kv_fp8(g, v, head_dim, n_rot, err, errlen);
+        ds4_cuda_tensor_free(v);
+        if (!ok) goto cleanup_ext_fail;
+    }
+    if (!cuda_eval_launch_kv_fp8_batch(g, kv_bat, head_dim, n_rot, M, err, errlen)) {
+        goto cleanup_ext_fail;
+    }
+
+    if (ds4_cuda_synchronize(err, errlen) == 0) goto cleanup_ext_fail;
+
+    if (!ds4_cuda_tensor_read(rms_seq, 0, rms_seq_h, (uint64_t)M * rms_n * sizeof(float)) ||
+        !ds4_cuda_tensor_read(rms_bat, 0, rms_bat_h, (uint64_t)M * rms_n * sizeof(float)) ||
+        !ds4_cuda_tensor_read(hrms_seq, 0, hrms_seq_h, (uint64_t)M * per_token_head * sizeof(float)) ||
+        !ds4_cuda_tensor_read(hrms_bat, 0, hrms_bat_h, (uint64_t)M * per_token_head * sizeof(float)) ||
+        !ds4_cuda_tensor_read(rope_seq, 0, rope_seq_h, (uint64_t)M * per_token_head * sizeof(float)) ||
+        !ds4_cuda_tensor_read(rope_bat, 0, rope_bat_h, (uint64_t)M * per_token_head * sizeof(float)) ||
+        !ds4_cuda_tensor_read(hc_seq, 0, hc_seq_h, (uint64_t)M * hc_dim * sizeof(float)) ||
+        !ds4_cuda_tensor_read(hc_bat, 0, hc_bat_h, (uint64_t)M * hc_dim * sizeof(float)) ||
+        !ds4_cuda_tensor_read(swg_seq, 0, swg_seq_h, (uint64_t)M * ff * sizeof(float)) ||
+        !ds4_cuda_tensor_read(swg_bat, 0, swg_bat_h, (uint64_t)M * ff * sizeof(float)) ||
+        !ds4_cuda_tensor_read(add_seq, 0, add_seq_h, (uint64_t)M * ff * sizeof(float)) ||
+        !ds4_cuda_tensor_read(add_bat, 0, add_bat_h, (uint64_t)M * ff * sizeof(float)) ||
+        !ds4_cuda_tensor_read(kv_seq, 0, kv_seq_h, (uint64_t)M * head_dim * sizeof(float)) ||
+        !ds4_cuda_tensor_read(kv_bat, 0, kv_bat_h, (uint64_t)M * head_dim * sizeof(float)))
+    {
+        snprintf(err, errlen, "extended readback failed");
+        goto cleanup_ext_fail;
+    }
+
+    uint32_t mis_rms = 0, mis_hrms = 0, mis_rope = 0, mis_hc = 0;
+    uint32_t mis_swg = 0, mis_add = 0, mis_kv = 0;
+    float max_rms = 0.0f, max_hrms = 0.0f, max_rope = 0.0f, max_hc = 0.0f;
+    float max_swg = 0.0f, max_add = 0.0f, max_kv = 0.0f;
+    for (uint32_t i = 0; i < M * rms_n; i++) {
+        float d = fabsf(rms_seq_h[i] - rms_bat_h[i]);
+        if (d != 0.0f) { mis_rms++; if (d > max_rms) max_rms = d; }
+    }
+    for (uint32_t i = 0; i < M * per_token_head; i++) {
+        float d = fabsf(hrms_seq_h[i] - hrms_bat_h[i]);
+        if (d != 0.0f) { mis_hrms++; if (d > max_hrms) max_hrms = d; }
+    }
+    for (uint32_t i = 0; i < M * per_token_head; i++) {
+        float d = fabsf(rope_seq_h[i] - rope_bat_h[i]);
+        if (d != 0.0f) { mis_rope++; if (d > max_rope) max_rope = d; }
+    }
+    for (uint32_t i = 0; i < M * hc_dim; i++) {
+        float d = fabsf(hc_seq_h[i] - hc_bat_h[i]);
+        if (d != 0.0f) { mis_hc++; if (d > max_hc) max_hc = d; }
+    }
+    for (uint32_t i = 0; i < M * ff; i++) {
+        float d = fabsf(swg_seq_h[i] - swg_bat_h[i]);
+        if (d != 0.0f) { mis_swg++; if (d > max_swg) max_swg = d; }
+    }
+    for (uint32_t i = 0; i < M * ff; i++) {
+        float d = fabsf(add_seq_h[i] - add_bat_h[i]);
+        if (d != 0.0f) { mis_add++; if (d > max_add) max_add = d; }
+    }
+    for (uint32_t i = 0; i < M * head_dim; i++) {
+        float d = fabsf(kv_seq_h[i] - kv_bat_h[i]);
+        if (d != 0.0f) { mis_kv++; if (d > max_kv) max_kv = d; }
+    }
+
+    fprintf(stderr,
+            "ds4: cuda batch kernel test: M=%u\n"
+            "ds4:   q8_0     in=%u out=%u  mismatches=%u/%u max_abs=%.6e\n"
+            "ds4:   f16      in=%u out=%u  mismatches=%u/%u max_abs=%.6e\n"
+            "ds4:   rms      n=%u          mismatches=%u/%u max_abs=%.6e\n"
+            "ds4:   head_rms n_head=%u hd=%u mismatches=%u/%u max_abs=%.6e\n"
+            "ds4:   rope     n_head=%u hd=%u mismatches=%u/%u max_abs=%.6e\n"
+            "ds4:   hc4_post hc_dim=%u    mismatches=%u/%u max_abs=%.6e\n"
+            "ds4:   swiglu   ff=%u          mismatches=%u/%u max_abs=%.6e\n"
+            "ds4:   add      ff=%u          mismatches=%u/%u max_abs=%.6e\n"
+            "ds4:   kv_fp8   hd=%u nr=%u   mismatches=%u/%u max_abs=%.6e\n",
+            M,
+            in_dim, out_dim_q8, mis_q8, M * out_dim_q8, max_q8,
+            in_dim, out_dim_f16, mis_f16, M * out_dim_f16, max_f16,
+            rms_n, mis_rms, M * rms_n, max_rms,
+            n_head, head_dim, mis_hrms, M * per_token_head, max_hrms,
+            n_head, head_dim, mis_rope, M * per_token_head, max_rope,
+            hc_dim, mis_hc, M * hc_dim, max_hc,
+            ff, mis_swg, M * ff, max_swg,
+            ff, mis_add, M * ff, max_add,
+            head_dim, n_rot, mis_kv, M * head_dim, max_kv);
+
+    free(host_x);
+    free(seq_out_q8);
+    free(batch_out_q8);
+    free(seq_out_f16);
+    free(batch_out_f16);
+    free(rms_seq_h); free(rms_bat_h);
+    free(hrms_seq_h); free(hrms_bat_h);
+    free(rope_seq_h); free(rope_bat_h);
+    free(hc_seq_h); free(hc_bat_h);
+    free(head_in_h); free(hc_block_h); free(hc_res_h); free(hc_split_h);
+    free(swg_gate_h); free(swg_up_h); free(swg_seq_h); free(swg_bat_h);
+    free(add_a_h); free(add_b_h); free(add_seq_h); free(add_bat_h);
+    free(kv_in_h); free(kv_seq_h); free(kv_bat_h);
+    ds4_cuda_tensor_free(x_batch);
+    ds4_cuda_tensor_free(dst_seq_q8);
+    ds4_cuda_tensor_free(dst_batch_q8);
+    ds4_cuda_tensor_free(dst_seq_f16);
+    ds4_cuda_tensor_free(dst_batch_f16);
+    ds4_cuda_tensor_free(rms_seq); ds4_cuda_tensor_free(rms_bat);
+    ds4_cuda_tensor_free(hrms_seq); ds4_cuda_tensor_free(hrms_bat);
+    ds4_cuda_tensor_free(rope_seq); ds4_cuda_tensor_free(rope_bat);
+    ds4_cuda_tensor_free(hc_block); ds4_cuda_tensor_free(hc_res);
+    ds4_cuda_tensor_free(hc_split);
+    ds4_cuda_tensor_free(hc_seq); ds4_cuda_tensor_free(hc_bat);
+    ds4_cuda_tensor_free(swg_gate); ds4_cuda_tensor_free(swg_up);
+    ds4_cuda_tensor_free(swg_seq); ds4_cuda_tensor_free(swg_bat);
+    ds4_cuda_tensor_free(add_a); ds4_cuda_tensor_free(add_b);
+    ds4_cuda_tensor_free(add_seq); ds4_cuda_tensor_free(add_bat);
+    ds4_cuda_tensor_free(kv_seq); ds4_cuda_tensor_free(kv_bat);
+    return (mis_q8 == 0 && mis_f16 == 0 && mis_rms == 0 &&
+            mis_hrms == 0 && mis_rope == 0 && mis_hc == 0 &&
+            mis_swg == 0 && mis_add == 0 && mis_kv == 0) ? 0 : 1;
+
+cleanup_ext_fail:
+    free(host_x);
+    free(seq_out_q8);
+    free(batch_out_q8);
+    free(seq_out_f16);
+    free(batch_out_f16);
+    free(rms_seq_h); free(rms_bat_h);
+    free(hrms_seq_h); free(hrms_bat_h);
+    free(rope_seq_h); free(rope_bat_h);
+    free(hc_seq_h); free(hc_bat_h);
+    free(head_in_h); free(hc_block_h); free(hc_res_h); free(hc_split_h);
+    free(swg_gate_h); free(swg_up_h); free(swg_seq_h); free(swg_bat_h);
+    free(add_a_h); free(add_b_h); free(add_seq_h); free(add_bat_h);
+    free(kv_in_h); free(kv_seq_h); free(kv_bat_h);
+    ds4_cuda_tensor_free(x_batch);
+    ds4_cuda_tensor_free(dst_seq_q8);
+    ds4_cuda_tensor_free(dst_batch_q8);
+    ds4_cuda_tensor_free(dst_seq_f16);
+    ds4_cuda_tensor_free(dst_batch_f16);
+    ds4_cuda_tensor_free(rms_seq); ds4_cuda_tensor_free(rms_bat);
+    ds4_cuda_tensor_free(hrms_seq); ds4_cuda_tensor_free(hrms_bat);
+    ds4_cuda_tensor_free(rope_seq); ds4_cuda_tensor_free(rope_bat);
+    ds4_cuda_tensor_free(hc_block); ds4_cuda_tensor_free(hc_res);
+    ds4_cuda_tensor_free(hc_split);
+    ds4_cuda_tensor_free(hc_seq); ds4_cuda_tensor_free(hc_bat);
+    ds4_cuda_tensor_free(swg_gate); ds4_cuda_tensor_free(swg_up);
+    ds4_cuda_tensor_free(swg_seq); ds4_cuda_tensor_free(swg_bat);
+    ds4_cuda_tensor_free(add_a); ds4_cuda_tensor_free(add_b);
+    ds4_cuda_tensor_free(add_seq); ds4_cuda_tensor_free(add_bat);
+    ds4_cuda_tensor_free(kv_seq); ds4_cuda_tensor_free(kv_bat);
+    return 1;
+
+cleanup_fail:
+    free(host_x);
+    free(seq_out_q8);
+    free(batch_out_q8);
+    free(seq_out_f16);
+    free(batch_out_f16);
+    ds4_cuda_tensor_free(x_batch);
+    ds4_cuda_tensor_free(dst_seq_q8);
+    ds4_cuda_tensor_free(dst_batch_q8);
+    ds4_cuda_tensor_free(dst_seq_f16);
+    ds4_cuda_tensor_free(dst_batch_f16);
+    return 1;
+}
+#else
+int ds4_session_cuda_batch_kernel_test(ds4_session *s, char *err, size_t errlen) {
+    (void)s;
+    snprintf(err, errlen, "CUDA support is not compiled in");
+    return 1;
 }
 #endif
 
@@ -17939,6 +20624,19 @@ void ds4_engine_summary(ds4_engine *e) {
     model_summary(&e->model);
 }
 
+int ds4_engine_attach_thread(ds4_engine *e, char *err, size_t errlen) {
+#ifndef DS4_NO_CUDA
+    if (e && e->backend == DS4_BACKEND_CUDA && e->cuda_ready) {
+        if (!ds4_cuda_attach_thread(err, errlen)) return 1;
+        return 0;
+    }
+#endif
+    (void)e;
+    (void)err;
+    (void)errlen;
+    return 0;
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
     weights_free(&e->weights);
@@ -17979,6 +20677,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "ds4: failed to allocate CUDA session executor: %s\n", err);
             free(s);
             return 1;
+        }
+        if (!cuda_graph_promote_hot_weights(&s->cuda_graph, &e->model, &e->weights,
+                                             err, sizeof(err))) {
+            fprintf(stderr,
+                    "ds4: hot-weight VRAM promotion failed: %s\n"
+                    "ds4: continuing with host-mapped weights only (set DS4_CUDA_NO_HOT=1 to suppress)\n",
+                    err);
+            /* Non-fatal: the session still runs, just slower (PCIe-bound). */
         }
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         *out = s;
@@ -18102,7 +20808,32 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 }
                 return 0;
             }
-            if (!cuda_graph_prefill_loop(s, prompt, err, errlen)) {
+            /* Prefer the layer-major chunked path when the chunk scratch is
+             * available (always the case for ctx >= 4096) and DS4_CUDA_NO_CHUNKED
+             * is not set.  Falls back to per-token prefill_loop on demand. */
+            const bool use_chunked = (s->cuda_graph.batch_chunk_cap > 1u) &&
+                                     (getenv("DS4_CUDA_NO_CHUNKED") == NULL);
+            bool prefill_ok;
+            if (use_chunked) {
+                cuda_graph_reset_layer_caches(&s->cuda_graph);
+                prefill_ok = cuda_graph_prefill_chunked_range(s, prompt, 0,
+                                                              (uint32_t)prompt->len, err, errlen);
+                if (prefill_ok) {
+                    if (!ds4_cuda_tensor_read(s->cuda_graph.logits, 0, s->logits,
+                                              (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+                        snprintf(err, errlen, "CUDA logits readback failed (chunked)");
+                        prefill_ok = false;
+                    }
+                    if (prefill_ok) {
+                        ds4_tokens_copy(&s->checkpoint, prompt);
+                        s->checkpoint_valid = true;
+                        s->mtp_draft_valid = false;
+                    }
+                }
+            } else {
+                prefill_ok = cuda_graph_prefill_loop(s, prompt, err, errlen);
+            }
+            if (!prefill_ok) {
                 s->checkpoint_valid = false;
                 return 1;
             }

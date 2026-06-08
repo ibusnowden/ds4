@@ -24,8 +24,32 @@ bool ds4_cuda_ready(void);
 const ds4_cuda_info *ds4_cuda_get_info(void);
 int ds4_cuda_synchronize(char *err, size_t errlen);
 
+/* Bind the CUDA context to the calling thread.  CUDA driver contexts can be
+ * current to at most one thread at a time; ds4_cuda_init() creates the
+ * context on the calling thread, so any other thread that wants to launch
+ * kernels (e.g. ds4-server's worker thread) must call this once before its
+ * first CUDA call.  Returns 1 on success and 0 with an error message on
+ * failure. */
+int ds4_cuda_attach_thread(char *err, size_t errlen);
+
+/* Live free VRAM in bytes for the current device (calls cuMemGetInfo so it
+ * reflects allocations made after init).  Returns 1 on success, 0 with an
+ * error message otherwise. */
+int ds4_cuda_get_free_mem(uint64_t *free_bytes, char *err, size_t errlen);
+
 ds4_cuda_tensor *ds4_cuda_tensor_alloc(uint64_t bytes);
 ds4_cuda_tensor *ds4_cuda_tensor_view(const ds4_cuda_tensor *base, uint64_t offset, uint64_t bytes);
+
+/* Multi-GPU expert residency.  ds4_cuda_peer_init() lazily brings up a second
+ * GPU's context and enables peer access; it returns 1 only when a usable peer
+ * device exists (single-GPU and DS4_CUDA_NO_PEER both return 0 quietly).  Once
+ * ready, ds4_cuda_tensor_alloc_peer() allocates weight pools in device-1 VRAM
+ * that device-0 kernels read over NVLink/PCIe.  Used by the hot-weight
+ * promoter to overflow routed experts that do not fit on device 0. */
+int ds4_cuda_peer_init(char *err, size_t errlen);
+bool ds4_cuda_peer_ready(void);
+int ds4_cuda_peer_free_mem(uint64_t *free_bytes, char *err, size_t errlen);
+ds4_cuda_tensor *ds4_cuda_tensor_alloc_peer(uint64_t bytes);
 void ds4_cuda_tensor_free(ds4_cuda_tensor *tensor);
 uint64_t ds4_cuda_tensor_bytes(const ds4_cuda_tensor *tensor);
 uint64_t ds4_cuda_tensor_device_ptr(const ds4_cuda_tensor *tensor);
@@ -40,6 +64,19 @@ int ds4_cuda_host_register(ds4_cuda_host_map **out, const void *host, uint64_t b
 void ds4_cuda_host_unregister(ds4_cuda_host_map *map);
 uint64_t ds4_cuda_host_device_ptr(const ds4_cuda_host_map *map);
 uint64_t ds4_cuda_host_bytes(const ds4_cuda_host_map *map);
+
+/* CUDA Graph capture for chunked prefill.  Enabled when DS4_CUDA_GRAPHS=1
+ * is set in the environment at ds4_cuda_init() time.  The capture API wraps
+ * cuStreamBeginCapture / cuStreamEndCapture / cuGraphInstantiateWithFlags /
+ * cuGraphLaunch on the global engine stream.  capture_end_launch caches the
+ * instantiated CUgraphExec across chunks and reuses it via cuGraphExecUpdate
+ * when the topology matches, falling back to a fresh instantiate on mismatch.
+ * Call capture_reset at the end of a prefill loop (or before reuse) to free
+ * the cached exec. */
+bool ds4_cuda_graphs_enabled(void);
+int ds4_cuda_capture_begin(char *err, size_t errlen);
+int ds4_cuda_capture_end_launch(char *err, size_t errlen);
+void ds4_cuda_capture_reset(void);
 
 int ds4_cuda_module_load_data(ds4_cuda_module **out, const void *image, char *err, size_t errlen);
 int ds4_cuda_module_load_source(ds4_cuda_module **out, const char *source, const char *name,

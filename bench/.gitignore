@@ -1,0 +1,8 @@
+# transient run outputs + staging/diag helpers (start with _)
+_*
+# build artifacts
+*.o
+p2p_probe
+p2p_bw
+ds4
+results/

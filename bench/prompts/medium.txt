@@ -1,0 +1,45 @@
+You are reading the source code of a large C inference engine. Below is one
+function that runs a transformer block on the GPU. After it, you must produce
+a careful review summarising:
+  1. What the function does, in 4 sentences.
+  2. Any places where floating-point ordering may differ from a CPU
+     reference, with the line numbers (if visible) noted.
+  3. Specific suggestions to tighten parity with the CPU reference, ranked by
+     expected impact.
+Do not invent line numbers; only cite what appears below. If a step is
+unclear, say so explicitly.
+
+```c
+static bool cuda_graph_eval_token(ds4_cuda_graph *g,
+                                  const ds4_model *model,
+                                  const ds4_weights *weights,
+                                  int token, uint32_t pos,
+                                  char *err, size_t errlen) {
+    if (!g || !g->executor_ready || !model || !weights) return false;
+    if (!cuda_graph_embed_token(g, model, weights, token, err, errlen)) return false;
+    const uint32_t hc_dim = (uint32_t)((uint64_t)DS4_N_HC * DS4_N_EMBD);
+    const uint32_t q_dim = (uint32_t)((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM);
+    ds4_cuda_tensor *cur_hc = g->cur_hc;
+    ds4_cuda_tensor *next_hc = g->next_hc;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        cuda_layer_ptrs L;
+        if (!cuda_layer_collect_ptrs(g, model, &weights->layer[il], il, &L, err, errlen)) return false;
+        ds4_cuda_layer_cache *lc = &g->layer_cache[il];
+        cuda_eval_launch_rms_general(g, g->eval_flat_hc, cur_hc, 0, hc_dim, false, err, errlen);
+        cuda_eval_launch_matvec_f16(g, g->eval_hc_mix, L.hc_attn_fn, g->eval_flat_hc, hc_dim, /*hc_mix*/0, err, errlen);
+        DS4_CUDA_LAUNCH(g->hc4_split_weighted_sum_norm_f32, 1, 1, 1, 256, 1, 1, 0, /*args*/0);
+        DS4_CUDA_SYNC();
+        cuda_eval_launch_matvec_q8_0(g, g->eval_qr, L.attn_q_a, g->eval_attn_norm, DS4_N_EMBD, DS4_N_LORA_Q, err, errlen);
+        cuda_eval_launch_rms_general(g, g->eval_qr_norm, g->eval_qr, L.attn_q_a_norm, DS4_N_LORA_Q, true, err, errlen);
+        cuda_eval_launch_matvec_q8_0(g, g->eval_q, L.attn_q_b, g->eval_qr_norm, DS4_N_LORA_Q, q_dim, err, errlen);
+        cuda_eval_launch_head_rms(g, g->eval_q, DS4_N_HEAD, DS4_N_HEAD_DIM, err, errlen);
+        cuda_eval_launch_rope(g, g->eval_q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false, err, errlen);
+        cuda_eval_launch_attention_mixed(g, g->eval_heads, g->eval_q, lc->raw_kv, lc->n_raw, lc->attn_comp_kv, lc->n_comp, /*allowed*/0, L.attn_sinks, DS4_N_HEAD_DIM, err, errlen);
+        // ... more layer body ...
+        ds4_cuda_tensor *tmp = cur_hc; cur_hc = next_hc; next_hc = tmp;
+    }
+    return true;
+}
+```
+
+Begin your review now, in plain prose. End with a brief recommendation table.

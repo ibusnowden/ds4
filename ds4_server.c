@@ -1575,16 +1575,23 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
     buf_puts(b,
         "## Tools\n\n"
         "You have access to a set of tools to help answer the user question. "
-        "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
-        "<｜DSML｜tool_calls>\n"
-        "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
-        "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
+        /* Plain ASCII tool-call format.  The earlier "<｜DSML｜...>" template
+         * used U+FF5C bars that collide with the model's special-token syntax,
+         * so the 2-bit model could not reliably reproduce it — it mangled the
+         * markers and frequently dropped parameter VALUES.  A plain-ASCII
+         * <tool_calls> block (the strict parser's style==1) is one the model
+         * emits cleanly; parse_native_tool_calls also accepts its <tool_call>/
+         * <toolInvocation> improvisations. */
+        "You can invoke tools by writing a \"<tool_calls>\" block like the following:\n\n"
+        "<tool_calls>\n"
+        "<invoke name=\"$TOOL_NAME\">\n"
+        "<parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</parameter>\n"
         "...\n"
-        "</｜DSML｜invoke>\n"
-        "<｜DSML｜invoke name=\"$TOOL_NAME2\">\n"
+        "</invoke>\n"
+        "<invoke name=\"$TOOL_NAME2\">\n"
         "...\n"
-        "</｜DSML｜invoke>\n"
-        "</｜DSML｜tool_calls>\n\n"
+        "</invoke>\n"
+        "</tool_calls>\n\n"
         "String parameters should be specified as is and set `string=\"true\"`. "
         "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
         "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
@@ -1709,14 +1716,14 @@ static void append_dsml_json_literal_escaped(buf *b, const char *s) {
 }
 
 static void append_dsml_arg(buf *b, const json_arg *arg) {
-    buf_puts(b, "<｜DSML｜parameter name=\"");
+    buf_puts(b, "<parameter name=\"");
     append_dsml_attr_escaped(b, arg->key);
     buf_puts(b, "\" string=\"");
     buf_puts(b, arg->is_string ? "true" : "false");
     buf_puts(b, "\">");
     if (arg->is_string) append_dsml_text_escaped(b, arg->value);
     else append_dsml_json_literal_escaped(b, arg->value);
-    buf_puts(b, "</｜DSML｜parameter>\n");
+    buf_puts(b, "</parameter>\n");
 }
 
 static bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order) {
@@ -1775,21 +1782,21 @@ static void append_json_object_ordered_or_empty(buf *b, const char *json, const 
 
 static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls, const tool_schema_orders *orders) {
     if (!calls || calls->len == 0) return;
-    buf_puts(b, "\n\n<｜DSML｜tool_calls>\n");
+    buf_puts(b, "\n\n<tool_calls>\n");
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
         const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
-        buf_puts(b, "<｜DSML｜invoke name=\"");
+        buf_puts(b, "<invoke name=\"");
         append_dsml_attr_escaped(b, tc->name);
         buf_puts(b, "\">\n");
         if (!append_dsml_arguments_from_json(b, tc->arguments, order)) {
-            buf_puts(b, "<｜DSML｜parameter name=\"arguments\" string=\"true\">");
+            buf_puts(b, "<parameter name=\"arguments\" string=\"true\">");
             append_dsml_text_escaped(b, tc->arguments);
-            buf_puts(b, "</｜DSML｜parameter>\n");
+            buf_puts(b, "</parameter>\n");
         }
-        buf_puts(b, "</｜DSML｜invoke>\n");
+        buf_puts(b, "</invoke>\n");
     }
-    buf_puts(b, "</｜DSML｜tool_calls>");
+    buf_puts(b, "</tool_calls>");
 }
 
 static bool role_is_system(const char *role) {
@@ -2517,13 +2524,25 @@ static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 static bool tool_calls_started(const char *text) {
     return text && (strstr(text, DS4_TOOL_CALLS_START) ||
                     strstr(text, DS4_TOOL_CALLS_START_SHORT) ||
-                    strstr(text, "<tool_calls>"));
+                    strstr(text, "<tool_calls>") ||
+                    /* native shapes the model emits when it ignores the DSML
+                     * instruction; parsed leniently in parse_native_tool_calls.
+                     * Detecting the close lets the decode loop STOP the turn
+                     * (see saw_tool_end handling) instead of running away. */
+                    strstr(text, "<tool_call>") ||
+                    strstr(text, "<toolInvocation>") ||
+                    strstr(text, "<tool_invocation>") ||
+                    strstr(text, "<tool>"));
 }
 
 static bool tool_calls_finished(const char *text) {
     return text && (strstr(text, DS4_TOOL_CALLS_END) ||
                     strstr(text, DS4_TOOL_CALLS_END_SHORT) ||
-                    strstr(text, "</tool_calls>"));
+                    strstr(text, "</tool_calls>") ||
+                    strstr(text, "</tool_call>") ||
+                    strstr(text, "</toolInvocation>") ||
+                    strstr(text, "</tool_invocation>") ||
+                    strstr(text, "</tool>"));
 }
 
 static size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
@@ -2611,6 +2630,131 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+/* Inner text between <name> and </name> in `region` (NULL if absent). */
+static char *xml_tag_inner(const char *region, const char *name) {
+    char open[64], close[64];
+    snprintf(open, sizeof open, "<%s>", name);
+    snprintf(close, sizeof close, "</%s>", name);
+    const char *a = strstr(region, open);
+    if (!a) return NULL;
+    a += strlen(open);
+    const char *b = strstr(a, close);
+    if (!b) return NULL;
+    return xstrndup(a, (size_t)(b - a));
+}
+
+/* Lenient fallback parser.  The model frequently ignores the rendered
+ * "<｜DSML｜tool_calls>" instruction (the U+FF5C markers collide with its own
+ * special-token syntax) and emits a native tool-call shape instead.  Recognize
+ * the observed variants so tool calls still surface as OpenAI tool_calls:
+ *   <tool_call> | <toolInvocation>
+ *     <tool_name> | <toolName> NAME </...>
+ *     <parameters>
+ *       <parameter name="p" string="true">V</parameter>   (typed)
+ *       <p>V</p>                                           (bare -> string)
+ *     </parameters>
+ *   </tool_call> | </toolInvocation>
+ * Only invoked when the strict DSML/XML parser found no <tool_calls> block, so
+ * it cannot change behaviour for well-formed DSML output.  Returns true and
+ * sets *content_len (bytes of leading non-tool content) when >=1 call parses. */
+static bool parse_native_tool_calls(const char *text, size_t *content_len, tool_calls *calls) {
+    static const char *wrap_open[]  = {"<tool_call>", "<toolInvocation>", "<tool_invocation>", "<tool>"};
+    static const char *wrap_close[] = {"</tool_call>", "</toolInvocation>", "</tool_invocation>", "</tool>"};
+    const int n_wrap = (int)(sizeof(wrap_open) / sizeof(wrap_open[0]));
+    const char *start = NULL;
+    int wi = 0;
+    for (int i = 0; i < n_wrap; i++) {
+        const char *s = strstr(text, wrap_open[i]);
+        if (s && (!start || s < start)) { start = s; wi = i; }
+    }
+    if (!start) return false;
+    const char *p = start;
+    while (true) {
+        const char *blk = strstr(p, wrap_open[wi]);
+        if (!blk) break;
+        const char *bend = strstr(blk, wrap_close[wi]);
+        if (!bend) break;
+        char *region = xstrndup(blk, (size_t)(bend - blk));
+        char *name = xml_tag_inner(region, "tool_name");
+        if (!name) name = xml_tag_inner(region, "toolName");
+        if (!name) name = xml_tag_inner(region, "invoke-name");
+        if (!name) name = xml_tag_inner(region, "invoke_name");
+        if (name) {
+            char *nm = name;
+            while (*nm && isspace((unsigned char)*nm)) nm++;
+            size_t nl = strlen(nm);
+            while (nl && isspace((unsigned char)nm[nl - 1])) nm[--nl] = '\0';
+            buf args = {0};
+            bool any = false;
+            const char *pp = region, *ps;
+            while ((ps = strstr(pp, "<parameter")) != NULL) {
+                const char *te = strchr(ps, '>');
+                if (!te) break;
+                char *tag = xstrndup(ps, (size_t)(te - ps + 1));
+                char *pn = dsml_attr(tag, "name");
+                char *pis = dsml_attr(tag, "string");
+                free(tag);
+                const char *vs = te + 1;
+                const char *ve = strstr(vs, "</parameter>");
+                if (pn && ve) {
+                    char *raw = xstrndup(vs, (size_t)(ve - vs));
+                    char *val = (pis && !strcmp(pis, "true")) ? dsml_unescape_text(raw) : xstrdup(raw);
+                    tool_call_json_args_add(&args, pn, val, pis ? pis : "true");
+                    free(raw); free(val);
+                    any = true;
+                    pp = ve + strlen("</parameter>");
+                } else {
+                    pp = te + 1;
+                }
+                free(pn); free(pis);
+            }
+            if (!any) {
+                char *params = xml_tag_inner(region, "parameters");
+                if (params) {
+                    const char *q = params;
+                    while ((q = strchr(q, '<')) != NULL) {
+                        if (q[1] == '/') { q++; continue; }
+                        const char *te = strchr(q, '>');
+                        if (!te) break;
+                        char *key = xstrndup(q + 1, (size_t)(te - (q + 1)));
+                        char *sp = strchr(key, ' ');
+                        if (sp) *sp = '\0';
+                        char close[96];
+                        snprintf(close, sizeof close, "</%s>", key);
+                        const char *ve = strstr(te + 1, close);
+                        if (ve) {
+                            char *raw = xstrndup(te + 1, (size_t)(ve - (te + 1)));
+                            char *val = dsml_unescape_text(raw);
+                            tool_call_json_args_add(&args, key, val, "true");
+                            free(raw); free(val);
+                            q = ve + strlen(close);
+                        } else {
+                            q = te + 1;
+                        }
+                        free(key);
+                    }
+                    free(params);
+                }
+            }
+            tool_call tc = {0};
+            tc.name = xstrdup(nm);
+            buf wrapped = {0};
+            buf_putc(&wrapped, '{');
+            buf_puts(&wrapped, args.ptr ? args.ptr : "");
+            buf_putc(&wrapped, '}');
+            tc.arguments = buf_take(&wrapped);
+            tool_calls_push(calls, tc);
+            buf_free(&args);
+        }
+        free(name);
+        free(region);
+        p = bend + strlen(wrap_close[wi]);
+    }
+    if (calls->len == 0) return false;
+    *content_len = (size_t)(start - text);
+    return true;
+}
+
 static bool parse_generated_message(const char *text, char **content_out,
                                     char **reasoning_out, tool_calls *calls) {
     const char *start = strstr(text, "\n\n" DS4_TOOL_CALLS_START);
@@ -2633,6 +2777,11 @@ static bool parse_generated_message(const char *text, char **content_out,
         style = start ? 1 : style;
     }
     if (!start) {
+        size_t native_len = 0;
+        if (parse_native_tool_calls(text, &native_len, calls)) {
+            split_reasoning_content(text, native_len, content_out, reasoning_out);
+            return true;
+        }
         split_reasoning_content(text, text ? strlen(text) : 0, content_out, reasoning_out);
         return true;
     }
@@ -5770,6 +5919,30 @@ static void generate_job(server *s, job *j) {
                        now_sec() - t0);
         }
     }
+    /* One-line greppable bench summary so the Pi harness can extract numbers
+     * without parsing the per-chunk decode lines.  prefill_tps counts only
+     * newly evaluated prefix tokens; if the request was fully cached
+     * (cached == prompt.len) we emit 0 to keep the field numeric. */
+    {
+        const double now = now_sec();
+        const double prefill_s = decode_t0 > t0 ? decode_t0 - t0 : 0.0;
+        const double decode_s = now > decode_t0 ? now - decode_t0 : 0.0;
+        const double e2e_s = now > t0 ? now - t0 : 0.0;
+        const int new_prefill = j->req.prompt.len > cached ? j->req.prompt.len - cached : 0;
+        const double prefill_tps = prefill_s > 0.0 ? (double)new_prefill / prefill_s : 0.0;
+        const double decode_tps = decode_s > 0.0 ? (double)completion / decode_s : 0.0;
+        const double e2e_tps = e2e_s > 0.0 ? (double)(new_prefill + completion) / e2e_s : 0.0;
+        server_log(LOG_GENERATION,
+                   "ds4-server: bench id=%s kind=%s prompt=%d cached=%d new=%d gen=%d "
+                   "prefill_s=%.3f decode_s=%.3f e2e_s=%.3f "
+                   "prefill_tps=%.2f decode_tps=%.2f e2e_tps=%.2f finish=%s",
+                   id,
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   j->req.prompt.len, cached, new_prefill, completion,
+                   prefill_s, decode_s, e2e_s,
+                   prefill_tps, decode_tps, e2e_tps,
+                   final_finish);
+    }
     if (strcmp(final_finish, "error") != 0) kv_cache_maybe_store_continued(s);
     free(parsed_content);
     free(parsed_reasoning);
@@ -5807,6 +5980,14 @@ static job *dequeue(server *s) {
 
 static void *worker_main(void *arg) {
     server *s = arg;
+    /* CUDA driver contexts are bound to a single thread.  The main thread
+     * created the context in ds4_engine_open; this worker thread must take
+     * ownership before launching kernels, otherwise every cuMem* call here
+     * fails with CUDA_ERROR_INVALID_CONTEXT. */
+    char attach_err[256] = "";
+    if (ds4_engine_attach_thread(s->engine, attach_err, sizeof(attach_err)) != 0) {
+        server_log(LOG_DEFAULT, "ds4-server: worker attach_thread failed: %s", attach_err);
+    }
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
@@ -6357,8 +6538,10 @@ int main(int argc, char **argv) {
 
     server_config cfg = parse_options(argc, argv);
 
+    const double load_t0 = now_sec();
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+    const double engine_open_s = now_sec() - load_t0;
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
 
@@ -6369,6 +6552,14 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
+    const double load_total_s = now_sec() - load_t0;
+    server_log(LOG_DEFAULT,
+               "ds4-server: model loaded in %.2fs (engine=%.2fs session=%.2fs backend=%s ctx=%d)",
+               load_total_s,
+               engine_open_s,
+               load_total_s - engine_open_s,
+               ds4_backend_name(cfg.engine.backend),
+               cfg.ctx_size);
 
     server s;
     memset(&s, 0, sizeof(s));
